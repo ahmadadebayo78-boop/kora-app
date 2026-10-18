@@ -204,7 +204,11 @@ pub fn deposit_fee(env: &Env, transfer_id: u64, buyer: Address, seller: Address,
 }
 
 /// Releases escrowed fee to seller minus platform fee.
-pub fn finalize_transfer(env: &Env, transfer_id: u64) {
+///
+/// Only the buyer, seller, or platform admin may finalize a transfer.
+/// Closes issue #235.
+pub fn finalize_transfer(env: &Env, caller: Address, transfer_id: u64) {
+    caller.require_auth();
     let key = EscrowDataKey::Entry(transfer_id);
     let mut entry: EscrowEntry = match env.storage().persistent().get(&key) {
         Some(entry) => entry,
@@ -212,6 +216,10 @@ pub fn finalize_transfer(env: &Env, transfer_id: u64) {
     };
     if entry.status != EscrowStatus::Held {
         panic_with_error!(env, EscrowError::InvalidEscrowState);
+    }
+    let is_admin = get_fee_recipient(env).map_or(false, |a| a == caller);
+    if caller != entry.buyer && caller != entry.seller && !is_admin {
+        panic_with_error!(env, EscrowError::Unauthorized);
     }
     let platform_fee = compute_platform_fee(entry.amount, entry.platform_fee_bps);
     let seller_amount = entry.amount - platform_fee;
@@ -231,7 +239,11 @@ pub fn finalize_transfer(env: &Env, transfer_id: u64) {
 }
 
 /// Refunds the full fee to the buyer (from Held or Disputed state).
-pub fn refund_fee(env: &Env, transfer_id: u64) {
+///
+/// Only the seller (conceding the refund) or the platform admin may call this.
+/// Closes issue #236.
+pub fn refund_fee(env: &Env, caller: Address, transfer_id: u64) {
+    caller.require_auth();
     let key = EscrowDataKey::Entry(transfer_id);
     let mut entry: EscrowEntry = match env.storage().persistent().get(&key) {
         Some(entry) => entry,
@@ -239,6 +251,10 @@ pub fn refund_fee(env: &Env, transfer_id: u64) {
     };
     if entry.status != EscrowStatus::Held && entry.status != EscrowStatus::Disputed {
         panic_with_error!(env, EscrowError::InvalidEscrowState);
+    }
+    let is_admin = get_fee_recipient(env).map_or(false, |a| a == caller);
+    if caller != entry.seller && !is_admin {
+        panic_with_error!(env, EscrowError::Unauthorized);
     }
     token_client(env).transfer(&env.current_contract_address(), &entry.buyer, &entry.amount);
     entry.status = EscrowStatus::Refunded;
@@ -285,22 +301,36 @@ pub fn admin_resolve_dispute(env: &Env, transfer_id: u64, decision: DisputeDecis
         panic_with_error!(env, EscrowError::InvalidEscrowState);
     }
 
-    let (seller_amount, buyer_amount): (i128, i128) = match decision {
+    // Compute gross amounts for each party before platform fee.
+    let (gross_seller, buyer_amount): (i128, i128) = match decision {
         DisputeDecision::RefundBuyer => (0, entry.amount),
         DisputeDecision::PaySeller => (entry.amount, 0),
         DisputeDecision::Split(seller_bps) => {
             if seller_bps > 10_000 {
                 panic_with_error!(env, EscrowError::FeeBpsTooHigh);
             }
-            let seller_amount = entry.amount * seller_bps as i128 / 10_000;
-            (seller_amount, entry.amount - seller_amount)
+            let seller_gross = entry.amount * seller_bps as i128 / 10_000;
+            (seller_gross, entry.amount - seller_gross)
         }
     };
+
+    // Deduct platform fee from the seller's portion when the seller receives
+    // funds. The buyer's refund portion is always fee-free. Closes issue #237.
+    let platform_fee = if gross_seller > 0 {
+        compute_platform_fee(gross_seller, entry.platform_fee_bps)
+    } else {
+        0
+    };
+    let seller_amount = gross_seller - platform_fee;
 
     let contract = env.current_contract_address();
     let client = token_client(env);
     if seller_amount > 0 {
         client.transfer(&contract, &entry.seller, &seller_amount);
+    }
+    if platform_fee > 0 {
+        let fee_recipient = get_fee_recipient(env).expect("fee recipient not configured");
+        client.transfer(&contract, &fee_recipient, &platform_fee);
     }
     if buyer_amount > 0 {
         client.transfer(&contract, &entry.buyer, &buyer_amount);
@@ -311,7 +341,7 @@ pub fn admin_resolve_dispute(env: &Env, transfer_id: u64, decision: DisputeDecis
 
     env.events().publish(
         (Symbol::new(env, "DISPUTE_RESOLVED"), transfer_id),
-        (entry.buyer.clone(), entry.seller.clone(), seller_amount, buyer_amount),
+        (entry.buyer.clone(), entry.seller.clone(), seller_amount, buyer_amount, platform_fee),
     );
 }
 
@@ -382,7 +412,7 @@ mod tests {
         c.run(|| {
             init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
             deposit_fee(&c.env, 2, c.buyer.clone(), c.seller.clone(), 10_000_000);
-            finalize_transfer(&c.env, 2);
+            finalize_transfer(&c.env, c.buyer.clone(), 2);
             assert_eq!(get_escrow(&c.env, 2).unwrap().status, EscrowStatus::Released);
         });
     }
@@ -399,7 +429,7 @@ mod tests {
         c.run(|| {
             init_escrow_config(&c.env, 100, c.platform.clone(), c.token.clone());
             deposit_fee(&c.env, 3, c.buyer.clone(), c.seller.clone(), 5_000_000);
-            refund_fee(&c.env, 3);
+            refund_fee(&c.env, c.seller.clone(), 3);
             assert_eq!(get_escrow(&c.env, 3).unwrap().status, EscrowStatus::Refunded);
         });
     }
@@ -411,8 +441,8 @@ mod tests {
         c.run(|| {
             init_escrow_config(&c.env, 100, c.platform.clone(), c.token.clone());
             deposit_fee(&c.env, 4, c.buyer.clone(), c.seller.clone(), 1_000_000);
-            finalize_transfer(&c.env, 4);
-            finalize_transfer(&c.env, 4);
+            finalize_transfer(&c.env, c.buyer.clone(), 4);
+            finalize_transfer(&c.env, c.buyer.clone(), 4);
         });
     }
 
@@ -423,8 +453,8 @@ mod tests {
         c.run(|| {
             init_escrow_config(&c.env, 100, c.platform.clone(), c.token.clone());
             deposit_fee(&c.env, 5, c.buyer.clone(), c.seller.clone(), 1_000_000);
-            finalize_transfer(&c.env, 5);
-            refund_fee(&c.env, 5);
+            finalize_transfer(&c.env, c.buyer.clone(), 5);
+            refund_fee(&c.env, c.seller.clone(), 5);
         });
     }
 
@@ -450,7 +480,7 @@ mod tests {
         });
         c.run(|| {
             dispute_transfer(&c.env, 7, c.buyer.clone());
-            refund_fee(&c.env, 7);
+            refund_fee(&c.env, c.seller.clone(), 7);
             assert_eq!(get_escrow(&c.env, 7).unwrap().status, EscrowStatus::Refunded);
         });
     }
@@ -483,7 +513,7 @@ mod tests {
         c.run(|| {
             init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
             deposit_fee(&c.env, 101, c.buyer.clone(), c.seller.clone(), 10_000_000);
-            finalize_transfer(&c.env, 101);
+            finalize_transfer(&c.env, c.buyer.clone(), 101);
         });
         assert_eq!(c.balance(&c.seller), 9_750_000);
         assert_eq!(c.balance(&c.platform), 250_000);
@@ -497,7 +527,7 @@ mod tests {
         c.run(|| {
             init_escrow_config(&c.env, 0, c.platform.clone(), c.token.clone());
             deposit_fee(&c.env, 102, c.buyer.clone(), c.seller.clone(), 10_000_000);
-            finalize_transfer(&c.env, 102);
+            finalize_transfer(&c.env, c.buyer.clone(), 102);
         });
         assert_eq!(c.balance(&c.seller), 10_000_000);
         assert_eq!(c.balance(&c.platform), 0);
@@ -512,7 +542,7 @@ mod tests {
         c.run(|| {
             init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
             deposit_fee(&c.env, 103, c.buyer.clone(), c.seller.clone(), 10_000_000);
-            refund_fee(&c.env, 103);
+            refund_fee(&c.env, c.seller.clone(), 103);
         });
         assert_eq!(c.balance(&c.buyer), before);
         assert_eq!(c.balance(&c.contract), 0);
@@ -529,7 +559,7 @@ mod tests {
         c.run(|| {
             init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
             // transfer_id 999 was never deposited
-            finalize_transfer(&c.env, 999);
+            finalize_transfer(&c.env, c.buyer.clone(), 999);
         });
     }
 
@@ -541,7 +571,7 @@ mod tests {
         c.run(|| {
             init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
             // transfer_id 999 was never deposited
-            refund_fee(&c.env, 999);
+            refund_fee(&c.env, c.seller.clone(), 999);
         });
     }
 
@@ -694,8 +724,8 @@ mod tests {
         c.run(|| {
             init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
             deposit_fee(&c.env, 32, c.buyer.clone(), c.seller.clone(), 1_000_000);
-            finalize_transfer(&c.env, 32);
-            finalize_transfer(&c.env, 32);
+            finalize_transfer(&c.env, c.buyer.clone(), 32);
+            finalize_transfer(&c.env, c.buyer.clone(), 32);
         });
     }
 
@@ -707,8 +737,8 @@ mod tests {
         c.run(|| {
             init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
             deposit_fee(&c.env, 33, c.buyer.clone(), c.seller.clone(), 1_000_000);
-            finalize_transfer(&c.env, 33);
-            refund_fee(&c.env, 33);
+            finalize_transfer(&c.env, c.buyer.clone(), 33);
+            refund_fee(&c.env, c.seller.clone(), 33);
         });
     }
 
@@ -750,7 +780,7 @@ mod tests {
         });
     }
 
-    /// Admin rules for the seller: the full escrowed amount is paid out.
+    /// Admin rules for the seller: the seller amount net of platform fee is paid out.
     #[test]
     fn admin_resolve_dispute_pays_seller() {
         let c = setup();
@@ -762,14 +792,17 @@ mod tests {
             dispute_transfer(&c.env, 201, c.buyer.clone());
             admin_resolve_dispute(&c.env, 201, DisputeDecision::PaySeller);
         });
-        assert_eq!(c.balance(&c.seller), 10_000_000);
+        // platform fee = 10_000_000 * 250 / 10_000 = 250_000
+        // seller receives net = 9_750_000
+        assert_eq!(c.balance(&c.seller), 9_750_000);
+        assert_eq!(c.balance(&c.platform), 250_000);
         assert_eq!(c.balance(&c.contract), 0);
         c.run(|| {
             assert_eq!(get_escrow(&c.env, 201).unwrap().status, EscrowStatus::Resolved);
         });
     }
 
-    /// Admin splits the escrowed amount between buyer and seller.
+    /// Admin splits the escrowed amount between buyer and seller (platform fee on seller portion).
     #[test]
     fn admin_resolve_dispute_split_decision() {
         let c = setup();
@@ -782,7 +815,12 @@ mod tests {
             dispute_transfer(&c.env, 202, c.buyer.clone());
             admin_resolve_dispute(&c.env, 202, DisputeDecision::Split(3_000));
         });
-        assert_eq!(c.balance(&c.seller), 3_000_000);
+        // gross_seller = 10_000_000 * 3000 / 10000 = 3_000_000
+        // platform_fee = 3_000_000 * 250 / 10_000 = 75_000
+        // net_seller   = 3_000_000 - 75_000 = 2_925_000
+        // buyer_amount = 10_000_000 - 3_000_000 = 7_000_000 (fee-free)
+        assert_eq!(c.balance(&c.seller), 2_925_000);
+        assert_eq!(c.balance(&c.platform), 75_000);
         assert_eq!(c.balance(&c.buyer), before - 10_000_000 + 7_000_000);
         assert_eq!(c.balance(&c.contract), 0);
         c.run(|| {
@@ -800,5 +838,125 @@ mod tests {
             deposit_fee(&c.env, 203, c.buyer.clone(), c.seller.clone(), 1_000_000);
             admin_resolve_dispute(&c.env, 203, DisputeDecision::RefundBuyer);
         });
+    }
+
+    // ── Issue #235: finalize_transfer caller authorization ────────────────────
+
+    /// A third party cannot finalize an escrow — Unauthorized.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn finalize_transfer_rejects_unauthorized_caller() {
+        let c = setup();
+        c.run(|| {
+            let stranger = Address::generate(&c.env);
+            init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
+            deposit_fee(&c.env, 300, c.buyer.clone(), c.seller.clone(), 1_000_000);
+            finalize_transfer(&c.env, stranger, 300);
+        });
+    }
+
+    /// The seller can also call finalize_transfer.
+    #[test]
+    fn finalize_transfer_seller_can_finalize() {
+        let c = setup();
+        c.run(|| {
+            init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
+            deposit_fee(&c.env, 301, c.buyer.clone(), c.seller.clone(), 10_000_000);
+            finalize_transfer(&c.env, c.seller.clone(), 301);
+            assert_eq!(get_escrow(&c.env, 301).unwrap().status, EscrowStatus::Released);
+        });
+    }
+
+    /// The platform admin can also call finalize_transfer.
+    #[test]
+    fn finalize_transfer_admin_can_finalize() {
+        let c = setup();
+        c.run(|| {
+            init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
+            deposit_fee(&c.env, 302, c.buyer.clone(), c.seller.clone(), 10_000_000);
+            finalize_transfer(&c.env, c.platform.clone(), 302);
+            assert_eq!(get_escrow(&c.env, 302).unwrap().status, EscrowStatus::Released);
+        });
+    }
+
+    // ── Issue #236: refund_fee caller authorization ───────────────────────────
+
+    /// A third party cannot refund an escrow — Unauthorized.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn refund_fee_rejects_unauthorized_caller() {
+        let c = setup();
+        c.run(|| {
+            let stranger = Address::generate(&c.env);
+            init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
+            deposit_fee(&c.env, 400, c.buyer.clone(), c.seller.clone(), 1_000_000);
+            refund_fee(&c.env, stranger, 400);
+        });
+    }
+
+    /// The buyer cannot call refund_fee (only seller or admin may concede a refund).
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn refund_fee_rejects_buyer_as_caller() {
+        let c = setup();
+        c.run(|| {
+            init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
+            deposit_fee(&c.env, 401, c.buyer.clone(), c.seller.clone(), 1_000_000);
+            refund_fee(&c.env, c.buyer.clone(), 401);
+        });
+    }
+
+    /// The platform admin can call refund_fee.
+    #[test]
+    fn refund_fee_admin_can_refund() {
+        let c = setup();
+        let before = c.balance(&c.buyer);
+        c.run(|| {
+            init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
+            deposit_fee(&c.env, 402, c.buyer.clone(), c.seller.clone(), 10_000_000);
+            refund_fee(&c.env, c.platform.clone(), 402);
+            assert_eq!(get_escrow(&c.env, 402).unwrap().status, EscrowStatus::Refunded);
+        });
+        assert_eq!(c.balance(&c.buyer), before);
+    }
+
+    // ── Issue #237: admin_resolve_dispute platform fee deduction ─────────────
+
+    /// When dispute resolves in buyer's favor, no platform fee is deducted.
+    #[test]
+    fn admin_resolve_dispute_refund_buyer_no_fee() {
+        let c = setup();
+        let before = c.balance(&c.buyer);
+        c.run(|| {
+            init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
+            deposit_fee(&c.env, 500, c.buyer.clone(), c.seller.clone(), 10_000_000);
+        });
+        c.run(|| {
+            dispute_transfer(&c.env, 500, c.buyer.clone());
+            admin_resolve_dispute(&c.env, 500, DisputeDecision::RefundBuyer);
+        });
+        // Buyer receives full amount back — no fee
+        assert_eq!(c.balance(&c.buyer), before);
+        assert_eq!(c.balance(&c.seller), 0);
+        assert_eq!(c.balance(&c.platform), 0);
+        assert_eq!(c.balance(&c.contract), 0);
+    }
+
+    /// When dispute resolves in seller's favor, platform fee is deducted from seller amount.
+    #[test]
+    fn admin_resolve_dispute_pay_seller_deducts_platform_fee() {
+        let c = setup();
+        c.run(|| {
+            init_escrow_config(&c.env, 250, c.platform.clone(), c.token.clone());
+            deposit_fee(&c.env, 501, c.buyer.clone(), c.seller.clone(), 10_000_000);
+        });
+        c.run(|| {
+            dispute_transfer(&c.env, 501, c.buyer.clone());
+            admin_resolve_dispute(&c.env, 501, DisputeDecision::PaySeller);
+        });
+        // platform_fee = 10_000_000 * 250 / 10_000 = 250_000
+        assert_eq!(c.balance(&c.seller), 9_750_000);
+        assert_eq!(c.balance(&c.platform), 250_000);
+        assert_eq!(c.balance(&c.contract), 0);
     }
 }
