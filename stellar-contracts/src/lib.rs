@@ -196,6 +196,8 @@ mod test_upgrade_proposal;
 // mod test_book_slot;
 #[cfg(test)]
 mod test_emergency_notify_rate_limit;
+#[cfg(test)]
+mod test_dispute_validation;
 
 const DEFAULT_NONCE_MAX_USES: u32 = 1;
 #[allow(dead_code)]
@@ -2453,6 +2455,12 @@ pub enum DisputeKey {
     DisputeVoteByVoter(u64, Address),
     /// Ordered list of addresses that have voted on a dispute (for enumeration).
     DisputeVoters(u64),
+    /// #293: Whether a given address is a registered (active) arbitrator.
+    RegisteredArbitrator(Address),
+    /// #293: Ordered list of all registered arbitrator addresses (for enumeration).
+    ArbitratorList,
+    /// #293: Per-arbitrator statistics (reputation, total rulings).
+    ArbitratorStatsKey(Address),
 }
 
 #[contract]
@@ -9504,9 +9512,24 @@ impl KoraContract {
 
     pub fn set_appeal_window(env: Env, admin: Address, window_seconds: u64) -> bool {
         Self::require_admin_auth(&env, &admin);
+
+        // #291: Enforce lower bound (1 day = 86 400 s) and upper bound (30 days = 2 592 000 s)
+        const MIN_APPEAL_WINDOW: u64 = 86_400;       // 1 day
+        const MAX_APPEAL_WINDOW: u64 = 2_592_000;    // 30 days
+        if window_seconds < MIN_APPEAL_WINDOW || window_seconds > MAX_APPEAL_WINDOW {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
         env.storage()
             .instance()
             .set(&DisputeKey::AppealWindow, &window_seconds);
+
+        // Emit AppealWindowUpdated event
+        env.events().publish(
+            (Symbol::new(&env, "AppealWindowUpdated"),),
+            (window_seconds,),
+        );
+
         true
     }
 
@@ -9515,9 +9538,81 @@ impl KoraContract {
         if admin == arbitrator {
             env.panic_with_error(ContractError::Unauthorized);
         }
+
+        // #293: Only allow registered (active) arbitrators to be assigned.
+        let is_registered: bool = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::RegisteredArbitrator(arbitrator.clone()))
+            .unwrap_or(false);
+        if !is_registered {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        // Capture previous arbitrator for the event (None if not yet set).
+        let previous: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::Arbitrator);
+
         env.storage()
             .instance()
             .set(&DisputeKey::Arbitrator, &arbitrator);
+
+        // Emit ArbitratorAssigned event with previous and new arbitrator.
+        env.events().publish(
+            (Symbol::new(&env, "ArbitratorAssigned"),),
+            (previous, arbitrator),
+        );
+
+        true
+    }
+
+    /// #293: Register an address as an active arbitrator.
+    /// Only an admin may register arbitrators.
+    /// Registered arbitrators are eligible for assignment via `assign_arbitrator`.
+    pub fn register_arbitrator(env: Env, admin: Address, arbitrator: Address) -> bool {
+        Self::require_admin_auth(&env, &admin);
+        if admin == arbitrator {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        // Mark as registered.
+        env.storage()
+            .instance()
+            .set(&DisputeKey::RegisteredArbitrator(arbitrator.clone()), &true);
+
+        // Append to the list if not already present.
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::ArbitratorList)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !list.contains(arbitrator.clone()) {
+            list.push_back(arbitrator.clone());
+            env.storage()
+                .instance()
+                .set(&DisputeKey::ArbitratorList, &list);
+        }
+
+        // Initialise stats record if not yet present.
+        let stats_key = DisputeKey::ArbitratorStatsKey(arbitrator.clone());
+        if env
+            .storage()
+            .instance()
+            .get::<DisputeKey, ArbitratorStats>(&stats_key)
+            .is_none()
+        {
+            env.storage().instance().set(
+                &stats_key,
+                &ArbitratorStats {
+                    address: arbitrator,
+                    reputation: 0,
+                    total_rulings: 0,
+                },
+            );
+        }
+
         true
     }
 
@@ -9535,6 +9630,11 @@ impl KoraContract {
         evidence_hash: String,
     ) -> u64 {
         claimer.require_auth();
+
+        // #292: Prevent self-disputes — claimer and target must be distinct.
+        if claimer == target {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
 
         let count: u64 = env
             .storage()
@@ -9773,6 +9873,14 @@ impl KoraContract {
         sha256_hash: BytesN<32>,
     ) -> u64 {
         submitter.require_auth();
+
+        // #290: Enforce CID length bounds — must be between 32 and 128 bytes (inclusive).
+        const MIN_CID_LEN: u32 = 32;
+        const MAX_CID_LEN: u32 = 128;
+        let cid_len = cid.len();
+        if cid_len < MIN_CID_LEN || cid_len > MAX_CID_LEN {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
 
         let dispute_key = DisputeKey::Dispute(dispute_id);
         let dispute: Dispute = env

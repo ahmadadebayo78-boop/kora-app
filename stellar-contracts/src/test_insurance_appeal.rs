@@ -580,3 +580,116 @@ fn test_get_claims_by_status_under_appeal() {
     assert_eq!(rejected.len(), 1);
     assert_eq!(rejected.get(0).unwrap().claim_id, claim_id2);
 }
+
+// ============================================================================
+// Issue #291 — set_appeal_window bounds validation
+// ============================================================================
+
+#[test]
+fn test_set_appeal_window_valid_lower_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, KoraContract);
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init_admin(&admin);
+
+    // Exactly 1 day (86 400 s) is the minimum valid value.
+    client.set_appeal_window(&admin, &86_400u64);
+}
+
+#[test]
+fn test_set_appeal_window_valid_upper_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, KoraContract);
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init_admin(&admin);
+
+    // Exactly 30 days (2 592 000 s) is the maximum valid value.
+    client.set_appeal_window(&admin, &2_592_000u64);
+}
+
+#[test]
+fn test_set_appeal_window_valid_midrange() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, KoraContract);
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init_admin(&admin);
+
+    // 7 days is a typical value — must succeed.
+    client.set_appeal_window(&admin, &(7 * 86_400u64));
+}
+
+#[test]
+#[should_panic(expected = "InvalidInput")]
+fn test_set_appeal_window_below_lower_bound_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, KoraContract);
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init_admin(&admin);
+
+    // 0 seconds — must be rejected.
+    client.set_appeal_window(&admin, &0u64);
+}
+
+#[test]
+#[should_panic(expected = "InvalidInput")]
+fn test_set_appeal_window_one_second_below_minimum_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, KoraContract);
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init_admin(&admin);
+
+    // 86 399 s = 1 day minus 1 second — must be rejected.
+    client.set_appeal_window(&admin, &86_399u64);
+}
+
+#[test]
+#[should_panic(expected = "InvalidInput")]
+fn test_set_appeal_window_above_upper_bound_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, KoraContract);
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init_admin(&admin);
+
+    // 2 592 001 s = 30 days + 1 second — must be rejected.
+    client.set_appeal_window(&admin, &2_592_001u64);
+}
+
+#[test]
+#[should_panic(expected = "InvalidInput")]
+fn test_set_appeal_window_u64_max_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, KoraContract);
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init_admin(&admin);
+
+    // u64::MAX — must be rejected.
+    client.set_appeal_window(&admin, &u64::MAX);
+}

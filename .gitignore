@@ -1,9 +1,41 @@
-target
-.snfoundry_cache/
+# Build artifacts
+target/
 stellar-contracts/target/
+
+# Cargo lock (root workspace manages it; individual crates excluded)
 stellar-contracts/Cargo.lock
+
+# Test snapshots (proptest / insta)
+test_snapshots/
 test_snapshots/test/test
-ISSUES.md
-node_modules
+**/*.snap
+**/*.snap.new
+
+# Starknet / Foundry cache
+.snfoundry_cache/
+
+# JavaScript / Node
+node_modules/
 .env
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+.DS_Store
+*.swp
+*.swo
+
+# Secrets and local config
+*.pem
+*.key
+secrets/
 somzilla.md
+ISSUES.md
+
+# Coverage reports
+coverage/
+*.profraw
+*.profdata
+lcov.info
+cobertura.xml
