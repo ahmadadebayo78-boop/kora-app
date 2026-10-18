@@ -196,6 +196,8 @@ mod test_upgrade_proposal;
 // mod test_book_slot;
 #[cfg(test)]
 mod test_emergency_notify_rate_limit;
+#[cfg(test)]
+mod test_drips_wave9;
 
 const DEFAULT_NONCE_MAX_USES: u32 = 1;
 #[allow(dead_code)]
@@ -3524,6 +3526,11 @@ impl KoraContract {
     ) -> Vec<AccessEvent> {
         caller.require_auth();
 
+        // Issue #276: validate timestamp range before doing any work.
+        if start_ts > end_ts {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
         // Authorisation: owner or admin
         let pet = env
             .storage()
@@ -3546,12 +3553,8 @@ impl KoraContract {
             env.panic_with_error(ContractError::Unauthorized);
         }
 
-        let key = (Symbol::new(&env, "access_logs"), pet_id);
-        let logs: Vec<AccessLog> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(Vec::new(&env));
+        // Issue #277: read from the ring buffer instead of a single Vec.
+        let logs = Self::read_all_logs(&env, pet_id);
 
         const PAGE_SIZE: u32 = 100;
         let page = if page == 0 { 1 } else { page };
@@ -3586,23 +3589,25 @@ impl KoraContract {
         result
     }
 
+    // ── Ring-buffer access logging (Issue #277) ───────────────────────────
+    //
+    // Each log entry is stored under its own persistent key:
+    //   (Symbol::new(env, "access_log"), (pet_id, index))
+    // where `index = seq % MAX_LOG_ENTRIES`.  A separate counter
+    //   (Symbol::new(env, "access_log_seq"), pet_id)
+    // tracks the total number of entries written.  When the buffer is full
+    // the oldest entry is overwritten in O(1) — no element shifting.
+
+    /// Append an access log entry in O(1) using a circular ring buffer.
     fn log_access(env: &Env, pet_id: u64, user: Address, action: AccessAction, details: String) {
-        let key = (Symbol::new(env, "access_logs"), pet_id);
-        let mut logs: Vec<AccessLog> = env
+        let seq_key = (Symbol::new(env, "access_log_seq"), pet_id);
+        let seq: u64 = env
             .storage()
             .persistent()
-            .get(&key)
-            .unwrap_or(Vec::new(env));
+            .get(&seq_key)
+            .unwrap_or(0);
 
-        while logs.len() >= MAX_LOG_ENTRIES {
-            logs.remove(0);
-        }
-
-        let id = if logs.is_empty() {
-            0
-        } else {
-            logs.get(logs.len() - 1).unwrap().id + 1
-        };
+        let id = seq;
         let log = AccessLog {
             id,
             pet_id,
@@ -3612,8 +3617,47 @@ impl KoraContract {
             details,
         };
 
-        logs.push_back(log);
-        env.storage().persistent().set(&key, &logs);
+        let slot = (seq % MAX_LOG_ENTRIES as u64) as u32;
+        let entry_key = (Symbol::new(env, "access_log"), (pet_id, slot));
+        env.storage().persistent().set(&entry_key, &log);
+
+        let next_seq = seq + 1;
+        env.storage().persistent().set(&seq_key, &next_seq);
+    }
+
+    /// Read all access log entries for a pet in chronological order (oldest
+    /// first).  Uses the ring-buffer layout from Issue #277.
+    fn read_all_logs(env: &Env, pet_id: u64) -> Vec<AccessLog> {
+        let seq_key = (Symbol::new(env, "access_log_seq"), pet_id);
+        let seq: u64 = env
+            .storage()
+            .persistent()
+            .get(&seq_key)
+            .unwrap_or(0);
+
+        if seq == 0 {
+            return Vec::new(env);
+        }
+
+        let cap = MAX_LOG_ENTRIES as u64;
+        let count = if seq > cap { cap } else { seq };
+        let start = if seq > cap { seq - cap } else { 0 };
+
+        let mut result = Vec::new(env);
+        let mut i = start;
+        while i < start + count {
+            let slot = (i % cap) as u32;
+            let entry_key = (Symbol::new(env, "access_log"), (pet_id, slot));
+            if let Some(log) = env
+                .storage()
+                .persistent()
+                .get::<_, AccessLog>(&entry_key)
+            {
+                result.push_back(log);
+            }
+            i += 1;
+        }
+        result
     }
 
     /// Read access log entries for a pet. Visible to the pet owner or any admin.
@@ -3633,11 +3677,7 @@ impl KoraContract {
             panic_with_error!(&env, ContractError::Unauthorized);
         }
 
-        let key = (Symbol::new(&env, "access_logs"), pet_id);
-        env.storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(Vec::new(&env))
+        Self::read_all_logs(&env, pet_id)
     }
 
     fn require_admin(env: &Env) {
@@ -6879,6 +6919,64 @@ impl KoraContract {
         );
 
         lab_id
+    }
+
+    // ── Reference-range management (Issue #652 / Issue #275) ──────────────
+    //
+    // Stores per-species biomarker reference ranges in persistent storage.
+    // `set_reference_range` enforces `min < max` so inverted intervals cannot
+    // corrupt downstream anomaly detection and health-score calculations.
+
+    /// Set the reference range for a species/biomarker pair.
+    /// Caller must be an admin.  Panics with `ContractError::InvalidInput`
+    /// if `min >= max` (Issue #275).
+    pub fn set_reference_range(
+        env: Env,
+        caller: Address,
+        species: String,
+        biomarker: String,
+        min: i128,
+        max: i128,
+    ) {
+        caller.require_auth();
+        if !Self::is_admin_address(&env, &caller) {
+            panic_with_error!(&env, ContractError::NotAnAdmin);
+        }
+
+        // Issue #275: reject inverted or degenerate ranges.
+        if min >= max {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        let range = ReferenceRange { min, max };
+        env.storage().persistent().set(
+            &ReferenceRangeKey::SpeciesBiomarker((species, biomarker)),
+            &range,
+        );
+    }
+
+    /// Read the reference range for a species/biomarker pair, if set.
+    pub fn get_reference_range(env: Env, species: String, biomarker: String) -> Option<ReferenceRange> {
+        env.storage()
+            .persistent()
+            .get(&ReferenceRangeKey::SpeciesBiomarker((species, biomarker)))
+    }
+
+    /// Remove the reference range for a species/biomarker pair.
+    /// Caller must be an admin.
+    pub fn remove_reference_range(
+        env: Env,
+        caller: Address,
+        species: String,
+        biomarker: String,
+    ) {
+        caller.require_auth();
+        if !Self::is_admin_address(&env, &caller) {
+            panic_with_error!(&env, ContractError::NotAnAdmin);
+        }
+        env.storage().persistent().remove(
+            &ReferenceRangeKey::SpeciesBiomarker((species, biomarker)),
+        );
     }
 
     pub fn get_lab_results(
@@ -11357,7 +11455,7 @@ impl KoraContract {
         }
 
         if record.deleted_at.is_some() {
-            panic_with_error!(&env, ContractError::AlreadyDeleted);
+            panic_with_error!(&env, ContractError::RecordAlreadyDeleted);
         }
 
         let now = env.ledger().timestamp();

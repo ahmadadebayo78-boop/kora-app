@@ -2,8 +2,44 @@ target
 .snfoundry_cache/
 stellar-contracts/target/
 stellar-contracts/Cargo.lock
+test_snapshots/
 test_snapshots/test/test
 ISSUES.md
 node_modules
 .env
 somzilla.md
+
+# Test snapshot directories (Soroban/soroban-test)
+**/test_snapshots/
+
+# Build artifacts
+**/target/
+**/out/
+**/dist/
+**/build/
+
+# Cache directories
+**/.cache/
+**/.snfoundry_cache/
+
+# Environment files
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Editor / IDE files
+**/.vscode/
+**/.idea/
+**/*.swp
+**/*.swo
+**/*~
+**/.DS_Store
+
+# Coverage reports
+**/coverage/
+**/*.lcov
+**/coverage-report/
+
+# Lock files (keep Cargo.lock for contract, ignore app-level)
+**/yarn.lock
+**/package-lock.json
