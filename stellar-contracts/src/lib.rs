@@ -119,6 +119,9 @@ pub enum BreedingKey {
     LineageDepth(u64),
     BreedingOffspringCount(u64),
     BreedingOffspringIndex((u64, u64)),
+    /// Issue #118: maps offspring_pet_id -> breeding_record_id so we can
+    /// detect when a pet is already registered as offspring of a litter.
+    OffspringLitter(u64),
 }
 
 /// Allele type for Mendelian genetics simulation.
@@ -10601,6 +10604,14 @@ impl KoraContract {
 
         let key = DataKey::EmergencyResponders(pet_id);
         let responders: Vec<Address> = env.storage().instance().get(&key).unwrap_or(Vec::new(&env));
+
+        // Issue #114: Verify the responder is actually registered before attempting
+        // removal. Without this check the function silently succeeds even for
+        // addresses that were never added, which misleads callers.
+        if !responders.contains(&responder) {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
         let mut updated = Vec::new(&env);
         for r in responders.iter() {
             if r != responder {
@@ -13229,11 +13240,29 @@ impl KoraContract {
             }
         }
 
+        // Issue #118: Prevent the same offspring_pet_id from being registered
+        // in more than one breeding record. The OffspringLitter key maps each
+        // offspring pet to the single record it belongs to; if it already
+        // exists the pet is already claimed by another litter.
+        if env
+            .storage()
+            .persistent()
+            .has(&BreedingKey::OffspringLitter(offspring_id))
+        {
+            panic_with_error!(&env, ContractError::InvalidState);
+        }
+
         // Store parent pair for pedigree queries (COI, lineage)
         env.storage().persistent().set(
             &BreedingKey::ParentPair(offspring_id),
             &(record.sire_id, record.dam_id),
         );
+
+        // Issue #118: Record which litter this offspring belongs to so that
+        // subsequent calls can detect and reject duplicate registrations.
+        env.storage()
+            .persistent()
+            .set(&BreedingKey::OffspringLitter(offspring_id), &record_id);
 
         record.offspring_count = record.offspring_count.saturating_add(1);
         env.storage()
