@@ -687,3 +687,5 @@ mod tests {
         let vets = client.list_vets(&1000, &10);
         assert!(vets.is_empty());
     }
+
+}

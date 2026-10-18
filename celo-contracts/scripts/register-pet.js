@@ -1,15 +1,34 @@
 const hre = require("hardhat");
 
-// Usage: CONTRACT_ADDRESS=0x... npx hardhat run scripts/register-pet.js --network <alfajores|celo|hardhat>
+// Usage: CONTRACT_ADDRESS=0x... PET_NAME=Rex PET_SPECIES=Dog PET_BREED=Labrador PET_BIRTHDAY=2020-01-01 npx hardhat run scripts/register-pet.js --network <alfajores|celo|hardhat>
 async function main() {
   const contractAddress = process.env.CONTRACT_ADDRESS;
   if (!contractAddress) {
     throw new Error("Set CONTRACT_ADDRESS to the deployed KoraRegistry address");
   }
 
+  const pet = {
+    name: process.env.PET_NAME || "Rex",
+    species: process.env.PET_SPECIES || "Dog",
+    breed: process.env.PET_BREED || "Labrador",
+    birthday: process.env.PET_BIRTHDAY || "2020-01-01",
+  };
+
+  const missing = Object.entries(pet)
+    .filter(([, value]) => !value || !value.trim())
+    .map(([key]) => key);
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required pet registration parameters: ${missing.join(", ")}. ` +
+        "Set PET_NAME, PET_SPECIES, PET_BREED, and PET_BIRTHDAY to non-empty values."
+    );
+  }
+
+  console.log("Registering pet with parameters:", pet);
+
   const registry = await hre.ethers.getContractAt("KoraRegistry", contractAddress);
 
-  const tx = await registry.registerPet("Rex", "Dog", "Labrador", "2020-01-01");
+  const tx = await registry.registerPet(pet.name, pet.species, pet.breed, pet.birthday);
   const receipt = await tx.wait();
 
   const event = receipt.logs
@@ -21,6 +40,10 @@ async function main() {
       }
     })
     .find((parsed) => parsed && parsed.name === "PetRegistered");
+
+  if (!event || !event.args) {
+    throw new Error("PetRegistered event not found in transaction receipt");
+  }
 
   console.log(`Pet registered with petId: ${event.args.petId}`);
 }

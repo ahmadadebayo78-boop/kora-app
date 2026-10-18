@@ -30,6 +30,7 @@ fn register_pet(
 fn breed_and_assign(
     env: &Env,
     client: &KoraContractClient,
+    owner: &Address,
     sire_id: u64,
     dam_id: u64,
     offspring_id: u64,
@@ -40,7 +41,7 @@ fn breed_and_assign(
         &env.ledger().timestamp(),
         &String::from_str(env, "litter"),
     );
-    assert!(client.add_offspring(&record_id, &offspring_id));
+    assert!(client.add_offspring(&record_id, &offspring_id, owner));
     record_id
 }
 
@@ -79,11 +80,11 @@ fn test_coi_half_siblings_returns_1250() {
 
     // Offspring from common_sire × dam_a
     let half_a = register_pet(&env, &client, &owner, "HalfA");
-    breed_and_assign(&env, &client, common_sire, dam_a, half_a);
+    breed_and_assign(&env, &client, &owner, common_sire, dam_a, half_a);
 
     // Offspring from common_sire × dam_b (same sire → half-siblings)
     let half_b = register_pet(&env, &client, &owner, "HalfB");
-    breed_and_assign(&env, &client, common_sire, dam_b, half_b);
+    breed_and_assign(&env, &client, &owner, common_sire, dam_b, half_b);
 
     // half_a and half_b share common_sire as parent.
     // Path: half_a → common_sire ← half_b
@@ -108,20 +109,20 @@ fn test_coi_first_cousins_full_siblings_returns_624() {
 
     // Parents of cousin A
     let parent_a = register_pet(&env, &client, &owner, "ParentA");
-    breed_and_assign(&env, &client, grand_sire, grand_dam, parent_a);
+    breed_and_assign(&env, &client, &owner, grand_sire, grand_dam, parent_a);
 
     // Parents of cousin B
     let parent_b = register_pet(&env, &client, &owner, "ParentB");
-    breed_and_assign(&env, &client, grand_sire, grand_dam, parent_b);
+    breed_and_assign(&env, &client, &owner, grand_sire, grand_dam, parent_b);
 
     // Cousins
     let cousin_a = register_pet(&env, &client, &owner, "CousinA");
     let unrelated_dam_a = register_pet(&env, &client, &owner, "UnrelatedDamA");
-    breed_and_assign(&env, &client, parent_a, unrelated_dam_a, cousin_a);
+    breed_and_assign(&env, &client, &owner, parent_a, unrelated_dam_a, cousin_a);
 
     let cousin_b = register_pet(&env, &client, &owner, "CousinB");
     let unrelated_dam_b = register_pet(&env, &client, &owner, "UnrelatedDamB");
-    breed_and_assign(&env, &client, parent_b, unrelated_dam_b, cousin_b);
+    breed_and_assign(&env, &client, &owner, parent_b, unrelated_dam_b, cousin_b);
 
     // cousin_a and cousin_b share grand_sire and grand_dam.
     // Through grand_sire: n1 = 2, n2 = 2 → 10000/2^5 = 10000/32 = 312
@@ -156,9 +157,9 @@ fn test_register_breeding_pair_rejects_high_coi() {
     let dam_a = register_pet(&env, &client, &owner, "DamA");
     let dam_b = register_pet(&env, &client, &owner, "DamB");
     let half_a = register_pet(&env, &client, &owner, "HalfA");
-    breed_and_assign(&env, &client, common_sire, dam_a, half_a);
+    breed_and_assign(&env, &client, &owner, common_sire, dam_a, half_a);
     let half_b = register_pet(&env, &client, &owner, "HalfB");
-    breed_and_assign(&env, &client, common_sire, dam_b, half_b);
+    breed_and_assign(&env, &client, &owner, common_sire, dam_b, half_b);
 
     // Attempt to breed with max_coi_bp = 1000 (< 1250 → should panic)
     client.register_breeding_pair(
