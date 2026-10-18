@@ -2,8 +2,10 @@ target
 .snfoundry_cache/
 stellar-contracts/target/
 stellar-contracts/Cargo.lock
-test_snapshots/test/test
+test_snapshots/
 ISSUES.md
 node_modules
 .env
 somzilla.md
+*.snap
+*.json.snap

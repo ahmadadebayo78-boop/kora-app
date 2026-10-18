@@ -9877,6 +9877,11 @@ impl KoraContract {
             .unwrap_or_else(|| panic_with_error!(env, ContractError::PetNotFound));
         pet.owner.require_auth();
 
+        // #287: start_date must not be in the past
+        if start_date < env.ledger().timestamp() {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
         if end_date <= start_date {
             panic_with_error!(&env, ContractError::InvalidInput);
         }
@@ -9975,12 +9980,28 @@ impl KoraContract {
 
     /// Advance a schedule: generate the next appointment slot after the most recent one.
     /// Returns the new grooming record id, or 0 if schedule is inactive/past end_date.
-    pub fn advance_schedule(env: Env, schedule_id: u64) -> u64 {
+    pub fn advance_schedule(env: Env, caller: Address, schedule_id: u64) -> u64 {
         let mut schedule: RecurringGroomingSchedule = env
             .storage()
             .instance()
             .get(&GroomingKey::RecurringSchedule(schedule_id))
             .unwrap_or_else(|| panic_with_error!(env, ContractError::InvalidInput));
+
+        // #288: require pet owner or registered groomer authorization
+        caller.require_auth();
+        let pet: Pet = env
+            .storage()
+            .instance()
+            .get(&DataKey::Pet(schedule.pet_id))
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::PetNotFound));
+        let is_owner = caller == pet.owner;
+        let is_groomer = env
+            .storage()
+            .instance()
+            .has(&GroomingKey::Groomer(caller.clone()));
+        if !is_owner && !is_groomer {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
 
         if !schedule.is_active {
             return 0;
@@ -10097,7 +10118,14 @@ impl KoraContract {
 
         env.storage()
             .instance()
-            .set(&GroomingKey::Groomer(address), &profile);
+            .set(&GroomingKey::Groomer(address.clone()), &profile);
+
+        // #289: emit GroomerRegistered event for indexers
+        env.events().publish(
+            (soroban_sdk::symbol_short!("grm_reg"),),
+            (address.clone(), profile.name.clone(), profile.license_id.clone()),
+        );
+
         true
     }
 
@@ -10136,7 +10164,14 @@ impl KoraContract {
                 profile.review_count = count + 1;
                 env.storage()
                     .instance()
-                    .set(&GroomingKey::Groomer(groomer_address), &profile);
+                    .set(&GroomingKey::Groomer(groomer_address.clone()), &profile);
+
+                // #289: emit GroomerRated event for indexers
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("grm_rate"),),
+                    (groomer_address, pet_id, score),
+                );
+
                 return true;
             }
         }
