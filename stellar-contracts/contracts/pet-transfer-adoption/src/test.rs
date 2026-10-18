@@ -1,7 +1,7 @@
 use super::{
-    AdoptionState, ContractError, DataKey,
-    PetOwnershipContract, PetOwnershipContractClient, TransferType, TrustedUpdateApprovalKey,
-    DISPUTE_WINDOW_SECONDS, MAX_REJECTION_REASON_LEN, MAX_CUSTODY_CHAIN_LENGTH,
+    AdoptionState, ContractError, DataKey, PetOwnershipContract, PetOwnershipContractClient,
+    TransferType, TrustedUpdateApprovalKey, DISPUTE_WINDOW_SECONDS, MAX_CUSTODY_CHAIN_LENGTH,
+    MAX_REJECTION_REASON_LEN,
 };
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
@@ -261,21 +261,23 @@ fn trusted_update_approvals_are_keyed_by_proposal_then_approver() {
     assert!(!client.update_trusted_contract(&proposal, &admin_one));
 
     env.as_contract(&contract_id, || {
-        let stored: Option<bool> = env.storage().instance().get(
-            &DataKey::TrustedUpdateApproval(TrustedUpdateApprovalKey {
+        let stored: Option<bool> = env
+            .storage()
+            .instance()
+            .get(&DataKey::TrustedUpdateApproval(TrustedUpdateApprovalKey {
                 proposal: proposal.clone(),
                 approver: admin_one.clone(),
-            }),
-        );
+            }));
         assert_eq!(stored, Some(true));
 
         // A swapped key must not resolve to the stored approval.
-        let swapped: Option<bool> = env.storage().instance().get(
-            &DataKey::TrustedUpdateApproval(TrustedUpdateApprovalKey {
+        let swapped: Option<bool> = env
+            .storage()
+            .instance()
+            .get(&DataKey::TrustedUpdateApproval(TrustedUpdateApprovalKey {
                 proposal: admin_one.clone(),
                 approver: proposal.clone(),
-            }),
-        );
+            }));
         assert_eq!(swapped, None);
     });
 
@@ -320,7 +322,7 @@ fn get_owner_pets_updates_after_transfer_acceptance() {
     env.ledger().with_mut(|l| {
         l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
     });
-    client.finalize_transfer(&pet_id);
+    client.finalize_transfer(&pet_id, &owner);
 
     let owner_pets = client.get_owner_pets(&owner);
     assert_eq!(owner_pets.len(), 1);
@@ -363,7 +365,7 @@ fn finalize_transfer_errors_when_history_is_missing() {
         l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
     });
 
-    let result = client.try_finalize_transfer(&pet_id);
+    let result = client.try_finalize_transfer(&pet_id, &owner);
     assert_eq!(
         result,
         Err(Ok(Error::from_contract_error(
@@ -390,7 +392,7 @@ fn finalize_transfer_errors_when_history_is_empty() {
         l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
     });
 
-    let result = client.try_finalize_transfer(&pet_id);
+    let result = client.try_finalize_transfer(&pet_id, &owner);
     assert_eq!(
         result,
         Err(Ok(Error::from_contract_error(
@@ -736,6 +738,26 @@ fn reject_adoption_rejects_oversized_reason() {
     );
 }
 
+#[test]
+fn reject_adoption_rejects_empty_reason() {
+    let (env, owner, adopter, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    client.sign_adoption(&pet_id, &adopter, &None);
+
+    let empty_reason = String::from_str(&env, "");
+    let result = client.try_reject_adoption(&pet_id, &owner, &empty_reason);
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::InvalidInput as u32,
+        )))
+    );
+}
+
 // ======================================================
 // Escrow + dispute window tests
 // ======================================================
@@ -775,7 +797,7 @@ fn finalize_transfer_before_window_is_rejected() {
         l.timestamp += DISPUTE_WINDOW_SECONDS - 1;
     });
 
-    let result = client.try_finalize_transfer(&pet_id);
+    let result = client.try_finalize_transfer(&pet_id, &owner);
     assert_eq!(
         result,
         Err(Ok(Error::from_contract_error(
@@ -799,7 +821,7 @@ fn finalize_transfer_after_window_transfers_ownership() {
     env.ledger().with_mut(|l| {
         l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
     });
-    client.finalize_transfer(&pet_id);
+    client.finalize_transfer(&pet_id, &owner);
 
     assert_eq!(client.get_current_owner(&pet_id), new_owner);
     assert!(client.get_escrowed_transfer(&pet_id).is_none());
@@ -824,7 +846,7 @@ fn raise_dispute_blocks_finalization() {
     env.ledger().with_mut(|l| {
         l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
     });
-    let result = client.try_finalize_transfer(&pet_id);
+    let result = client.try_finalize_transfer(&pet_id, &owner);
     assert_eq!(
         result,
         Err(Ok(Error::from_contract_error(
@@ -860,11 +882,11 @@ fn raise_dispute_after_window_is_rejected() {
 
 #[test]
 fn finalize_transfer_no_escrowed_transfer_errors() {
-    let (env, _, _, pet_id) = setup();
+    let (env, owner, _, pet_id) = setup();
     let contract_id = env.register_contract(None, PetOwnershipContract);
     let client = PetOwnershipContractClient::new(&env, &contract_id);
 
-    let result = client.try_finalize_transfer(&pet_id);
+    let result = client.try_finalize_transfer(&pet_id, &owner);
     assert_eq!(
         result,
         Err(Ok(Error::from_contract_error(
@@ -946,7 +968,7 @@ fn finalize_transfer_appends_direct_custody_entry() {
     env.ledger().with_mut(|l| {
         l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
     });
-    client.finalize_transfer(&pet_id);
+    client.finalize_transfer(&pet_id, &owner);
 
     let chain = client.get_custody_chain(&pet_id);
     assert_eq!(chain.len(), 1);
@@ -972,7 +994,7 @@ fn multiple_finalizations_produce_ordered_chain() {
     env.ledger().with_mut(|l| {
         l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
     });
-    client.finalize_transfer(&pet_id);
+    client.finalize_transfer(&pet_id, &owner);
 
     // Second transfer
     client.initiate_transfer(&pet_id, &third_owner);
@@ -980,7 +1002,7 @@ fn multiple_finalizations_produce_ordered_chain() {
     env.ledger().with_mut(|l| {
         l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
     });
-    client.finalize_transfer(&pet_id);
+    client.finalize_transfer(&pet_id, &new_owner);
 
     let chain = client.get_custody_chain(&pet_id);
     assert_eq!(chain.len(), 2);
@@ -1020,7 +1042,7 @@ fn custody_chain_is_append_only_no_delete_path() {
     env.ledger().with_mut(|l| {
         l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
     });
-    client.finalize_transfer(&pet_id);
+    client.finalize_transfer(&pet_id, &owner);
 
     // Chain has one entry; no contract function can remove it
     let chain = client.get_custody_chain(&pet_id);
@@ -1033,7 +1055,7 @@ fn custody_chain_is_append_only_no_delete_path() {
     env.ledger().with_mut(|l| {
         l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
     });
-    client.finalize_transfer(&pet_id);
+    client.finalize_transfer(&pet_id, &new_owner);
 
     let chain = client.get_custody_chain(&pet_id);
     assert_eq!(chain.len(), 2);
@@ -1387,12 +1409,7 @@ fn complete_adoption_event_includes_from_to_and_timestamp() {
 // ======================================================
 
 /// Runs one full direct transfer cycle, leaving `to` as the current owner.
-fn transfer_once(
-    env: &Env,
-    client: &PetOwnershipContractClient,
-    pet_id: &u64,
-    to: &Address,
-) {
+fn transfer_once(env: &Env, client: &PetOwnershipContractClient, pet_id: &u64, to: &Address) {
     // 250+ transfers in one test would otherwise exhaust the test budget.
     env.budget().reset_unlimited();
     client.initiate_transfer(pet_id, to);
@@ -1400,7 +1417,7 @@ fn transfer_once(
     env.ledger().with_mut(|l| {
         l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
     });
-    client.finalize_transfer(pet_id);
+    client.finalize_transfer(pet_id, to);
 }
 
 #[test]
@@ -1416,7 +1433,10 @@ fn custody_chain_is_capped_at_max_length() {
         let to = if i % 2 == 0 { &new_owner } else { &owner };
         transfer_once(&env, &client, &pet_id, to);
     }
-    assert_eq!(client.get_custody_chain(&pet_id).len(), MAX_CUSTODY_CHAIN_LENGTH);
+    assert_eq!(
+        client.get_custody_chain(&pet_id).len(),
+        MAX_CUSTODY_CHAIN_LENGTH
+    );
 
     let second_entry = client.get_custody_chain(&pet_id).get(1).unwrap();
 
@@ -1430,4 +1450,440 @@ fn custody_chain_is_capped_at_max_length() {
     // The newest transfer is retained at the tail.
     let newest = chain.get(MAX_CUSTODY_CHAIN_LENGTH - 1).unwrap();
     assert_eq!(newest.to, new_owner);
+}
+
+// ======================================================
+// Issue #62: Pause transfer timers during active disputes
+// ======================================================
+
+#[test]
+fn reclaim_transfer_blocked_while_escrowed_transfer_is_disputed() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    // Initiate and accept to create an escrowed transfer
+    client.initiate_transfer(&pet_id, &new_owner);
+    client.accept_transfer(&pet_id);
+
+    // Raise a dispute on the escrowed transfer
+    client.raise_dispute(&pet_id, &owner);
+    let escrowed = client.get_escrowed_transfer(&pet_id).unwrap();
+    assert!(escrowed.disputed);
+
+    // Also create a fresh pending transfer so reclaim_transfer has something to act on
+    // (simulate a direct pending transfer on the same pet with a forced timeout advance)
+    client.initiate_transfer(&pet_id, &new_owner);
+
+    // Advance time past TRANSFER_EXPIRY_SECONDS
+    env.ledger().with_mut(|l| {
+        l.timestamp += 7 * 24 * 60 * 60 + 1;
+    });
+
+    // reclaim_transfer should fail with TransferDisputed
+    let result = client.try_reclaim_transfer(&pet_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::TransferDisputed as u32,
+        )))
+    );
+}
+
+#[test]
+fn cancel_expired_transfer_blocked_while_escrowed_transfer_is_disputed() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    // Initiate and accept to create an escrowed transfer
+    client.initiate_transfer(&pet_id, &new_owner);
+    client.accept_transfer(&pet_id);
+
+    // Raise a dispute on the escrowed transfer
+    client.raise_dispute(&pet_id, &owner);
+    let escrowed = client.get_escrowed_transfer(&pet_id).unwrap();
+    assert!(escrowed.disputed);
+
+    // Create a pending transfer and advance time past its timeout
+    client.initiate_transfer_with_timeout(&pet_id, &new_owner, &1u32);
+    env.ledger().with_mut(|l| {
+        l.timestamp += 1 * 24 * 60 * 60 + 1;
+    });
+
+    // cancel_expired_transfer should fail with TransferDisputed
+    let result = client.try_cancel_expired_transfer(&pet_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::TransferDisputed as u32,
+        )))
+    );
+}
+
+#[test]
+fn reclaim_transfer_allowed_when_no_active_dispute() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    client.initiate_transfer(&pet_id, &new_owner);
+
+    // Advance time past TRANSFER_EXPIRY_SECONDS (no dispute active)
+    env.ledger().with_mut(|l| {
+        l.timestamp += 7 * 24 * 60 * 60 + 1;
+    });
+
+    // Should succeed — no dispute
+    client.reclaim_transfer(&pet_id);
+    assert!(!client.has_pending_transfer(&pet_id));
+}
+
+// ======================================================
+// Issue #111 – CustodyEntry logged on finalize_transfer and adoption paths
+// ======================================================
+
+#[test]
+fn finalize_transfer_appends_direct_custody_entry() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    client.initiate_transfer(&pet_id, &new_owner);
+    client.accept_transfer(&pet_id);
+
+    env.ledger().with_mut(|l| {
+        l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
+    });
+    client.finalize_transfer(&pet_id, &owner);
+
+    let chain = client.get_custody_chain(&pet_id);
+    assert_eq!(
+        chain.len(),
+        1,
+        "finalize_transfer must append exactly one custody entry"
+    );
+
+    let entry = chain.get(0).unwrap();
+    assert_eq!(entry.from, owner);
+    assert_eq!(entry.to, new_owner);
+    assert_eq!(entry.transfer_type, TransferType::Direct);
+}
+
+#[test]
+fn finalize_transfer_custody_entry_records_correct_timestamp() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    client.initiate_transfer(&pet_id, &new_owner);
+    client.accept_transfer(&pet_id);
+
+    let finalize_ts = DISPUTE_WINDOW_SECONDS + 100;
+    env.ledger().with_mut(|l| l.timestamp = finalize_ts);
+    client.finalize_transfer(&pet_id, &owner);
+
+    let entry = client.get_custody_chain(&pet_id).get(0).unwrap();
+    assert_eq!(
+        entry.timestamp, finalize_ts,
+        "custody entry timestamp must equal the ledger time at finalization"
+    );
+}
+
+#[test]
+fn complete_adoption_appends_adoption_custody_entry() {
+    let (env, owner, adopter, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    client.sign_adoption(&pet_id, &adopter, &None);
+    client.approve_adoption(&pet_id, &adopter);
+    client.complete_adoption(&pet_id);
+
+    let chain = client.get_custody_chain(&pet_id);
+    assert_eq!(
+        chain.len(),
+        1,
+        "complete_adoption must append exactly one custody entry"
+    );
+
+    let entry = chain.get(0).unwrap();
+    assert_eq!(entry.from, owner);
+    assert_eq!(entry.to, adopter);
+    assert_eq!(
+        entry.transfer_type,
+        TransferType::Adoption,
+        "adoption transfers must be logged with TransferType::Adoption"
+    );
+}
+
+#[test]
+fn waive_waiting_period_appends_adoption_custody_entry() {
+    let (env, owner, adopter, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    // Set a non-zero waiting period so waive_waiting_period is meaningful.
+    client.create_pet(&pet_id, &owner);
+    client.set_adoption_config(&(3 * 24 * 60 * 60), &owner); // 3-day waiting period
+    client.sign_adoption(&pet_id, &adopter, &None);
+    client.approve_adoption(&pet_id, &adopter);
+
+    // waive_waiting_period bypasses the waiting period; admin == owner here.
+    client.waive_waiting_period(
+        &pet_id,
+        &owner,
+        &soroban_sdk::String::from_str(&env, "emergency placement"),
+    );
+
+    let chain = client.get_custody_chain(&pet_id);
+    assert_eq!(
+        chain.len(),
+        1,
+        "waive_waiting_period must append exactly one custody entry"
+    );
+
+    let entry = chain.get(0).unwrap();
+    assert_eq!(entry.from, owner);
+    assert_eq!(entry.to, adopter);
+    assert_eq!(
+        entry.transfer_type,
+        TransferType::Adoption,
+        "waived adoption must still be logged as TransferType::Adoption"
+    );
+}
+
+#[test]
+fn multiple_transfers_produce_sequential_custody_chain() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+    let third_owner = Address::generate(&env);
+
+    client.create_pet(&pet_id, &owner);
+
+    // First transfer: owner -> new_owner via finalize_transfer
+    client.initiate_transfer(&pet_id, &new_owner);
+    client.accept_transfer(&pet_id);
+    env.ledger()
+        .with_mut(|l| l.timestamp += DISPUTE_WINDOW_SECONDS + 1);
+    client.finalize_transfer(&pet_id, &owner);
+
+    // Second transfer: new_owner -> third_owner via finalize_transfer
+    client.initiate_transfer(&pet_id, &third_owner);
+    client.accept_transfer(&pet_id);
+    env.ledger()
+        .with_mut(|l| l.timestamp += DISPUTE_WINDOW_SECONDS + 1);
+    client.finalize_transfer(&pet_id, &new_owner);
+
+    let chain = client.get_custody_chain(&pet_id);
+    assert_eq!(
+        chain.len(),
+        2,
+        "two finalizations must produce two custody entries"
+    );
+
+    let first = chain.get(0).unwrap();
+    assert_eq!(first.from, owner);
+    assert_eq!(first.to, new_owner);
+    assert_eq!(first.transfer_type, TransferType::Direct);
+
+    let second = chain.get(1).unwrap();
+    assert_eq!(second.from, new_owner);
+    assert_eq!(second.to, third_owner);
+    assert_eq!(second.transfer_type, TransferType::Direct);
+
+    // Timestamps are non-decreasing (chronological order).
+    assert!(first.timestamp <= second.timestamp);
+}
+
+#[test]
+fn custody_chain_empty_before_any_transfer() {
+    let (env, owner, _, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+
+    let chain = client.get_custody_chain(&pet_id);
+    assert_eq!(
+        chain.len(),
+        0,
+        "custody chain must be empty before any transfer is finalized"
+    );
+}
+
+// ======================================================
+// Issues #190, #191, #192, #193 tests
+// ======================================================
+
+// ---- Issue #190: Party authorization in finalize_transfer ----
+
+#[test]
+fn finalize_transfer_rejected_for_third_party() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+    let stranger = Address::generate(&env);
+
+    client.create_pet(&pet_id, &owner);
+    client.initiate_transfer(&pet_id, &new_owner);
+    client.accept_transfer(&pet_id);
+
+    env.ledger().with_mut(|l| {
+        l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
+    });
+
+    let result = client.try_finalize_transfer(&pet_id, &stranger);
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::Unauthorized as u32,
+        )))
+    );
+    assert_eq!(client.get_current_owner(&pet_id), owner);
+}
+
+#[test]
+fn finalize_transfer_succeeds_for_recipient() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    client.initiate_transfer(&pet_id, &new_owner);
+    client.accept_transfer(&pet_id);
+
+    env.ledger().with_mut(|l| {
+        l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
+    });
+
+    // The recipient ('to' address) finalizes
+    client.finalize_transfer(&pet_id, &new_owner);
+
+    assert_eq!(client.get_current_owner(&pet_id), new_owner);
+    assert!(client.get_escrowed_transfer(&pet_id).is_none());
+}
+
+#[test]
+fn finalize_transfer_succeeds_for_sender() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    client.initiate_transfer(&pet_id, &new_owner);
+    client.accept_transfer(&pet_id);
+
+    env.ledger().with_mut(|l| {
+        l.timestamp += DISPUTE_WINDOW_SECONDS + 1;
+    });
+
+    // The sender ('from' address) finalizes
+    client.finalize_transfer(&pet_id, &owner);
+
+    assert_eq!(client.get_current_owner(&pet_id), new_owner);
+    assert!(client.get_escrowed_transfer(&pet_id).is_none());
+}
+
+// ---- Issue #191: Upper bound on transfer_timeout_days ----
+
+#[test]
+fn initiate_transfer_with_timeout_rejects_greater_than_90_days() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+
+    let result = client.try_initiate_transfer_with_timeout(&pet_id, &new_owner, &91u32);
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::InvalidTimeoutDays as u32,
+        )))
+    );
+    assert!(!client.has_pending_transfer(&pet_id));
+}
+
+#[test]
+fn initiate_transfer_with_timeout_accepts_valid_range() {
+    let (env, owner, new_owner, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+
+    client.initiate_transfer_with_timeout(&pet_id, &new_owner, &30u32);
+    assert!(client.has_pending_transfer(&pet_id));
+    assert_eq!(
+        client.get_transfer_timeout_secs(&pet_id),
+        Some(30 * 24 * 60 * 60)
+    );
+}
+
+// ---- Issue #192: Revert self-adoptions in sign_adoption ----
+
+#[test]
+fn sign_adoption_rejects_self_adoption() {
+    let (env, owner, _, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+
+    // Attempting to sign an adoption agreement to oneself must fail
+    let result = client.try_sign_adoption(&pet_id, &owner, &None);
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::InvalidRecipient as u32,
+        )))
+    );
+    assert!(client.get_pending_adoption(&pet_id).is_none());
+}
+
+#[test]
+fn sign_adoption_accepts_distinct_recipient() {
+    let (env, owner, adopter, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+
+    client.sign_adoption(&pet_id, &adopter, &None);
+    assert!(client.get_pending_adoption(&pet_id).is_some());
+}
+
+// ---- Issue #193: Prevent pet creation with pet_id == 0 ----
+
+#[test]
+fn create_pet_rejects_zero_pet_id() {
+    let (env, owner, _, _) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    let result = client.try_create_pet(&0u64, &owner);
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::InvalidInput as u32,
+        )))
+    );
+}
+
+#[test]
+fn create_pet_succeeds_for_positive_pet_id() {
+    let (env, owner, _, _) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&1u64, &owner);
+    assert_eq!(client.get_current_owner(&1u64), owner);
 }

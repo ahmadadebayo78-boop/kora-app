@@ -385,3 +385,26 @@ fn test_get_admins_no_admin() {
 
     assert_eq!(client.get_admins().len(), 0);
 }
+
+#[test]
+fn test_init_admin_initializes_multisig_config() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup_client(&env);
+    let admin = Address::generate(&env);
+
+    client.init_admin(&admin);
+
+    let admins = client.get_admins();
+    assert_eq!(admins.len(), 1);
+    assert_eq!(admins.get(0).unwrap(), admin);
+    assert_eq!(client.get_admin_threshold(), 1u32);
+
+    // Verify governance proposal functions work seamlessly following single-admin initialization
+    let action = ProposalAction::VerifyVet(Address::generate(&env));
+    let proposal_id = client.propose_action(&admin, &action, &3600u64);
+    assert_eq!(proposal_id, 1u64);
+
+    // Verify set_threshold works seamlessly without panicking with AdminsNotSet
+    client.set_threshold(&admin, &1u32);
+}

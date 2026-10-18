@@ -2,8 +2,9 @@
 mod test {
     use crate::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
-        Env,
+        testutils::{Address as _, Events, Ledger},
+        xdr::ContractEventBody,
+        Env, TryFromVal, TryIntoVal, Val,
     };
 
     #[test]
@@ -218,6 +219,77 @@ mod test {
     }
 
     #[test]
+    fn test_issue_213_link_unlink_and_relink_tag() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, KoraContract);
+        let client = KoraContractClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let pet_id = client.register_pet(
+            &owner,
+            &String::from_str(&env, "Max"),
+            &String::from_str(&env, "2021-05-10"),
+            &Gender::Male,
+            &Species::Dog,
+            &String::from_str(&env, "Beagle"),
+            &PrivacyLevel::Public,
+        );
+
+        // 1. Link initial tag
+        let tag1 = client.link_tag_to_pet(&pet_id);
+        assert_eq!(client.get_tag_by_pet(&pet_id), Some(tag1.clone()));
+        assert_eq!(client.is_tag_active(&tag1), Some(true));
+
+        // 2. Unlink tag
+        let ok = client.unlink_tag(&pet_id);
+        assert!(ok);
+
+        // Verify TagUnlinkedEvent was published immediately
+        let target_topic = String::from_str(&env, "TAG_UNLINKED");
+        let all = env.events().all();
+        let mut found = false;
+        for event in all.events() {
+            let ContractEventBody::V0(body) = &event.body;
+            let mut topics: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
+            for sv in body.topics.iter() {
+                topics.push_back(sv.clone().try_into_val(&env).unwrap());
+            }
+            if topics.len() > 0 {
+                let t0: Val = topics.get(0).unwrap();
+                if let Ok(s) = String::try_from_val(&env, &t0) {
+                    if s == target_topic {
+                        let ev: TagUnlinkedEvent = body.data.clone().try_into_val(&env).unwrap();
+                        assert_eq!(ev.tag_id, tag1);
+                        assert_eq!(ev.pet_id, pet_id);
+                        assert_eq!(ev.owner, owner);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found, "TAG_UNLINKED event was not emitted");
+
+        // Verify reverse-lookup removed and tag deactivated
+        assert_eq!(client.get_tag_by_pet(&pet_id), None);
+        assert_eq!(client.is_tag_active(&tag1), Some(false));
+        assert_eq!(client.get_pet_by_tag(&tag1), None);
+
+        // Unlinking again when no tag is linked returns false
+        assert_eq!(client.unlink_tag(&pet_id), false);
+
+        // 3. Link a new tag to the pet
+        let tag2 = client.link_tag_to_pet(&pet_id);
+        assert_ne!(tag1, tag2);
+        assert_eq!(client.get_tag_by_pet(&pet_id), Some(tag2.clone()));
+        assert_eq!(client.is_tag_active(&tag2), Some(true));
+        let profile = client.get_pet_by_tag(&tag2).unwrap();
+        assert_eq!(profile.id, pet_id);
+    }
+
+    #[test]
     fn test_pet_privacy_flow() {
         let env = Env::default();
         env.mock_all_auths();
@@ -350,6 +422,9 @@ mod test {
         let contract_id = env.register_contract(None, KoraContract);
         let client = KoraContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
+        client.init_admin(&admin);
+
         let owner = Address::generate(&env);
         let vet = Address::generate(&env);
 
@@ -366,19 +441,31 @@ mod test {
             &PrivacyLevel::Public,
         );
 
+        client.register_vet(
+            &vet,
+            &String::from_str(&env, "Dr. Test"),
+            &String::from_str(&env, "LIC-TEST"),
+            &String::from_str(&env, "General"),
+        );
+        client.verify_vet(&admin, &vet);
+
         let lab_id = client.add_lab_result(
             &pet_id,
             &vet,
             &String::from_str(&env, "Blood Test"),
             &String::from_str(&env, "Normal"),
+            &String::from_str(&env, "0-200"),
+            &0u32,
+            &200u32,
+            &None,
             &None,
         );
 
         let res = client.get_lab_result(&lab_id).unwrap();
         assert_eq!(res.test_type, String::from_str(&env, "Blood Test"));
-        assert_eq!(res.result_summary, String::from_str(&env, "Normal"));
+        assert_eq!(res.results, String::from_str(&env, "Normal"));
 
-        let list = client.get_pet_lab_results(&pet_id);
+        let list = client.get_lab_results(&pet_id, &owner, &0u64, &10u32, &None, &None);
         assert_eq!(list.len(), 1);
     }
 
