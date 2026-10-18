@@ -227,6 +227,8 @@ mod test_grooming_slot_booking;
 #[cfg(test)]
 mod test_access_control;
 #[cfg(test)]
+mod test_access_logs_pagination;
+#[cfg(test)]
 mod test_activity;
 #[cfg(test)]
 mod test_activity_idempotency;
@@ -1270,6 +1272,7 @@ pub enum DataKey {
     EmergencyAuditLog(u64),
     EmergencyResponders(u64),
     EmergencyNotifyRateLimit((Address, u64)), // (caller, pet_id) -> NotifyRateLimit
+    PetNotifyRateLimit(u64), // pet_id -> NotifyRateLimit (per-pet rate limit)
     BreedMetadata(String),
     SpeciesBreedList(String),
     CallerNonce(Address),
@@ -4340,10 +4343,16 @@ impl KoraContract {
         env.storage().persistent().set(&key, &logs);
     }
 
-    /// Read access log entries for a pet. Visible to the pet owner or any admin.
+    /// Read access log entries for a pet with pagination. Visible to the pet owner or any admin.
     /// Includes emergency-grant and emergency-revoke entries written by
     /// `add_emergency_responder` / `remove_emergency_responder`.
-    pub fn get_access_logs(env: Env, pet_id: u64, caller: Address) -> Vec<AccessLog> {
+    pub fn get_access_logs(
+        env: Env,
+        pet_id: u64,
+        caller: Address,
+        offset: u64,
+        limit: u32,
+    ) -> Vec<AccessLog> {
         caller.require_auth();
 
         let pet: crate::Pet = env
@@ -4358,10 +4367,22 @@ impl KoraContract {
         }
 
         let key = (Symbol::new(&env, "access_logs"), pet_id);
-        env.storage()
+        let all_logs: Vec<AccessLog> = env
+            .storage()
             .persistent()
             .get(&key)
-            .unwrap_or(Vec::new(&env))
+            .unwrap_or(Vec::new(&env));
+
+        // Clamp limit to a maximum of 50 entries per call.
+        let effective_limit = if limit > 50 { 50 } else { limit } as u64;
+        let start = offset.min(all_logs.len() as u64);
+        let end = (start + effective_limit).min(all_logs.len() as u64);
+
+        let mut page: Vec<AccessLog> = Vec::new(&env);
+        for i in start..end {
+            page.push_back(all_logs.get(i as u32).unwrap());
+        }
+        page
     }
 
     fn require_admin(env: &Env) {
@@ -10656,6 +10677,9 @@ impl KoraContract {
         if contacts.is_empty() {
             panic_with_error!(env, ContractError::InvalidInput);
         }
+        if contacts.len() > 10 {
+            panic_with_error!(env, ContractError::TooManyItems);
+        }
 
         let mut has_primary = false;
         let mut priorities = soroban_sdk::Vec::new(env);
@@ -10722,6 +10746,11 @@ impl KoraContract {
             pet.updated_at = env.ledger().timestamp();
 
             Self::store_pet(&env, pet_id, &pet);
+
+            env.events().publish(
+                (Symbol::new(&env, "EmergContactUpd"), pet_id),
+                contacts.len() as u32,
+            );
         } else {
             panic_with_error!(&env, ContractError::PetNotFound);
         }
@@ -10925,6 +10954,7 @@ impl KoraContract {
     /// notified.
     pub fn notify_emergency_contacts(env: Env, caller: Address, pet_id: u64) -> u32 {
         const MAX_NOTIFICATIONS_PER_WINDOW: u32 = 3;
+        const MAX_PET_NOTIFICATIONS_PER_HOUR: u32 = 5;
         const RATE_LIMIT_WINDOW_SECONDS: u64 = 3_600;
 
         caller.require_auth();
@@ -10940,6 +10970,8 @@ impl KoraContract {
         }
 
         let now = env.ledger().timestamp();
+
+        // --- Per-caller rate limit (existing behavior) ---
         let rate_key = DataKey::EmergencyNotifyRateLimit((caller.clone(), pet_id));
         let mut rate_limit: NotifyRateLimit = env
             .storage()
@@ -10950,7 +10982,6 @@ impl KoraContract {
                 count: 0,
             });
 
-        // Reset the window once an hour has elapsed since it started.
         if now >= rate_limit.window_start.saturating_add(RATE_LIMIT_WINDOW_SECONDS) {
             rate_limit = NotifyRateLimit {
                 window_start: now,
@@ -10962,8 +10993,33 @@ impl KoraContract {
             panic_with_error!(&env, ContractError::RateLimitExceeded);
         }
 
+        // --- Per-pet rate limit (Issue #281): max 5 notifications per pet per hour ---
+        let pet_rate_key = DataKey::PetNotifyRateLimit(pet_id);
+        let mut pet_rate_limit: NotifyRateLimit = env
+            .storage()
+            .instance()
+            .get(&pet_rate_key)
+            .unwrap_or(NotifyRateLimit {
+                window_start: now,
+                count: 0,
+            });
+
+        if now >= pet_rate_limit.window_start.saturating_add(RATE_LIMIT_WINDOW_SECONDS) {
+            pet_rate_limit = NotifyRateLimit {
+                window_start: now,
+                count: 0,
+            };
+        }
+
+        if pet_rate_limit.count >= MAX_PET_NOTIFICATIONS_PER_HOUR {
+            panic_with_error!(&env, ContractError::RateLimitExceeded);
+        }
+
         rate_limit.count += 1;
         env.storage().instance().set(&rate_key, &rate_limit);
+
+        pet_rate_limit.count += 1;
+        env.storage().instance().set(&pet_rate_key, &pet_rate_limit);
 
         let contacts = KoraContract::get_emergency_contacts(env.clone(), pet_id, caller.clone());
 
