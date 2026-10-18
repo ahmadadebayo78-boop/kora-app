@@ -54,20 +54,20 @@ fn test_self_reference_rejected() {
         &String::from_str(&env, "bad"),
     );
 
-    client.add_offspring(&record_id, &sire);
+    client.add_offspring(&record_id, &sire, &owner);
 }
 
 #[test]
 #[should_panic(expected = "Error(Contract, #16)")]
 fn test_cycle_insertion_rejected() {
-    let (env, client, _owner, sire, dam, offspring, _grandchild) = setup();
+    let (env, client, owner, sire, dam, offspring, _grandchild) = setup();
     let record_id = client.add_breeding_record(
         &sire,
         &dam,
         &env.ledger().timestamp(),
         &String::from_str(&env, "first"),
     );
-    assert!(client.add_offspring(&record_id, &offspring));
+    assert!(client.add_offspring(&record_id, &offspring, &owner));
 
     let cycle_record = client.add_breeding_record(
         &offspring,
@@ -75,19 +75,19 @@ fn test_cycle_insertion_rejected() {
         &env.ledger().timestamp(),
         &String::from_str(&env, "cycle"),
     );
-    client.add_offspring(&cycle_record, &sire);
+    client.add_offspring(&cycle_record, &sire, &owner);
 }
 
 #[test]
 fn test_get_lineage_returns_parent_tree() {
-    let (env, client, _owner, sire, dam, offspring, grandchild) = setup();
+    let (env, client, owner, sire, dam, offspring, grandchild) = setup();
     let first = client.add_breeding_record(
         &sire,
         &dam,
         &env.ledger().timestamp(),
         &String::from_str(&env, "first"),
     );
-    assert!(client.add_offspring(&first, &offspring));
+    assert!(client.add_offspring(&first, &offspring, &owner));
 
     let second = client.add_breeding_record(
         &offspring,
@@ -95,7 +95,7 @@ fn test_get_lineage_returns_parent_tree() {
         &env.ledger().timestamp(),
         &String::from_str(&env, "second"),
     );
-    assert!(client.add_offspring(&second, &grandchild));
+    assert!(client.add_offspring(&second, &grandchild, &owner));
 
     let lineage = client.get_lineage(&grandchild, &2);
     assert_eq!(lineage.len(), 4);
@@ -103,4 +103,78 @@ fn test_get_lineage_returns_parent_tree() {
     assert_eq!(lineage.get(1).unwrap(), dam);
     assert_eq!(lineage.get(2).unwrap(), sire);
     assert_eq!(lineage.get(3).unwrap(), dam);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_add_offspring_unauthorized_caller_rejected() {
+    let (env, client, _owner, sire, dam, offspring, _grandchild) = setup();
+    let record_id = client.add_breeding_record(
+        &sire,
+        &dam,
+        &env.ledger().timestamp(),
+        &String::from_str(&env, "unauth"),
+    );
+    let stranger = Address::generate(&env);
+    client.add_offspring(&record_id, &offspring, &stranger);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")]
+fn test_add_offspring_nonexistent_pet_rejected() {
+    let (env, client, owner, sire, dam, _offspring, _grandchild) = setup();
+    let record_id = client.add_breeding_record(
+        &sire,
+        &dam,
+        &env.ledger().timestamp(),
+        &String::from_str(&env, "nonexistent"),
+    );
+    let nonexistent_pet_id = 999_999u64;
+    client.add_offspring(&record_id, &nonexistent_pet_id, &owner);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_get_lineage_max_depth_exceeded_rejected() {
+    let (env, client, owner, sire, dam, offspring, grandchild) = setup();
+    let first = client.add_breeding_record(
+        &sire,
+        &dam,
+        &env.ledger().timestamp(),
+        &String::from_str(&env, "first"),
+    );
+    assert!(client.add_offspring(&first, &offspring, &owner));
+    let second = client.add_breeding_record(
+        &offspring,
+        &dam,
+        &env.ledger().timestamp(),
+        &String::from_str(&env, "second"),
+    );
+    assert!(client.add_offspring(&second, &grandchild, &owner));
+
+    // max_depth 15 exceeds MAX_ALLOWED_LINEAGE_DEPTH (8), must reject with InvalidInput (#12)
+    client.get_lineage(&grandchild, &15);
+}
+
+#[test]
+fn test_get_lineage_up_to_max_depth_succeeds() {
+    let (env, client, owner, sire, dam, offspring, grandchild) = setup();
+    let first = client.add_breeding_record(
+        &sire,
+        &dam,
+        &env.ledger().timestamp(),
+        &String::from_str(&env, "first"),
+    );
+    assert!(client.add_offspring(&first, &offspring, &owner));
+    let second = client.add_breeding_record(
+        &offspring,
+        &dam,
+        &env.ledger().timestamp(),
+        &String::from_str(&env, "second"),
+    );
+    assert!(client.add_offspring(&second, &grandchild, &owner));
+
+    // max_depth 8 must succeed safely
+    let lineage = client.get_lineage(&grandchild, &8);
+    assert_eq!(lineage.len(), 4);
 }

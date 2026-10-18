@@ -1,5 +1,5 @@
 use crate::{ContractError, Gender, KoraContract, KoraContractClient, PrivacyLevel, Species};
-use soroban_sdk::{testutils::Address as _, Address, Env, String, Vec};
+use soroban_sdk::{testutils::Address as _, Address, Env, Error, String, Vec};
 
 fn setup(env: &Env) -> (KoraContractClient, Address) {
     let contract_id = env.register_contract(None, KoraContract);
@@ -161,4 +161,244 @@ fn test_clear_breed_list_allows_any_breed() {
     // Now any breed is accepted
     let id = register(&env, &client, "Rex", &Species::Dog, "Poodle");
     assert!(id > 0);
+}
+
+// --- Issue #195: Validate color length and positive weight in register_pet ---
+
+#[test]
+fn test_register_pet_empty_color_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let owner = Address::generate(&env);
+
+    let result = client.try_register_pet(
+        &owner,
+        &String::from_str(&env, "Buddy"),
+        &String::from_str(&env, "2020-01-01"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Labrador"),
+        &String::from_str(&env, ""),
+        &10u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::InvalidInput as u32,
+        )))
+    );
+}
+
+#[test]
+fn test_register_pet_color_too_long_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let owner = Address::generate(&env);
+
+    // 101 characters exceeds MAX_STR_SHORT (100)
+    let long_color = "a".repeat(101);
+    let result = client.try_register_pet(
+        &owner,
+        &String::from_str(&env, "Buddy"),
+        &String::from_str(&env, "2020-01-01"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Labrador"),
+        &String::from_str(&env, &long_color),
+        &10u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::InvalidInput as u32,
+        )))
+    );
+}
+
+#[test]
+fn test_register_pet_zero_weight_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let owner = Address::generate(&env);
+
+    let result = client.try_register_pet(
+        &owner,
+        &String::from_str(&env, "Buddy"),
+        &String::from_str(&env, "2020-01-01"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Labrador"),
+        &String::from_str(&env, "Brown"),
+        &0u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::InvalidInput as u32,
+        )))
+    );
+}
+
+#[test]
+fn test_register_pet_valid_color_and_weight_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let owner = Address::generate(&env);
+
+    // Exactly 1 char color
+    let id1 = client.register_pet(
+        &owner,
+        &String::from_str(&env, "BuddyOne"),
+        &String::from_str(&env, "2020-01-01"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Labrador"),
+        &String::from_str(&env, "B"),
+        &1u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+    assert!(id1 > 0);
+
+    // Exactly 100 char color
+    let max_color = "c".repeat(100);
+    let id2 = client.register_pet(
+        &owner,
+        &String::from_str(&env, "BuddyTwo"),
+        &String::from_str(&env, "2020-01-01"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Labrador"),
+        &String::from_str(&env, &max_color),
+        &50u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+    assert!(id2 > 0);
+}
+
+// --- Issue #196: Maintain species indexing and count upon species update in update_pet_profile ---
+
+#[test]
+fn test_update_pet_species_updates_species_counts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let owner = Address::generate(&env);
+
+    let pet_id = client.register_pet(
+        &owner,
+        &String::from_str(&env, "Milo"),
+        &String::from_str(&env, "2020-01-01"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Labrador"),
+        &String::from_str(&env, "Golden"),
+        &25u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    let dog_str = String::from_str(&env, "Dog");
+    let cat_str = String::from_str(&env, "Cat");
+
+    assert_eq!(client.get_species_count(&dog_str), 1);
+    assert_eq!(client.get_species_count(&cat_str), 0);
+
+    // Update species from Dog to Cat
+    let success = client.update_pet_profile(
+        &pet_id,
+        &String::from_str(&env, "Milo"),
+        &String::from_str(&env, "2020-01-01"),
+        &Gender::Male,
+        &Species::Cat,
+        &String::from_str(&env, "Persian"),
+        &String::from_str(&env, "White"),
+        &10u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+    assert!(success);
+
+    // Verify species counters reflect the change
+    assert_eq!(client.get_species_count(&dog_str), 0);
+    assert_eq!(client.get_species_count(&cat_str), 1);
+}
+
+// --- Issue #197: Return ContractError::PetNotFound instead of silent boolean false in update_pet_profile ---
+
+#[test]
+fn test_update_pet_profile_nonexistent_pet_returns_pet_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+
+    let result = client.try_update_pet_profile(
+        &999999u64,
+        &String::from_str(&env, "Ghost"),
+        &String::from_str(&env, "2020-01-01"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Labrador"),
+        &String::from_str(&env, "Brown"),
+        &15u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::PetNotFound as u32,
+        )))
+    );
+}
+
+#[test]
+fn test_update_pet_profile_success_returns_true() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _) = setup(&env);
+    let owner = Address::generate(&env);
+
+    let pet_id = client.register_pet(
+        &owner,
+        &String::from_str(&env, "Bella"),
+        &String::from_str(&env, "2021-05-10"),
+        &Gender::Female,
+        &Species::Dog,
+        &String::from_str(&env, "Beagle"),
+        &String::from_str(&env, "Tricolor"),
+        &12u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    let updated = client.update_pet_profile(
+        &pet_id,
+        &String::from_str(&env, "BellaUpdated"),
+        &String::from_str(&env, "2021-05-10"),
+        &Gender::Female,
+        &Species::Dog,
+        &String::from_str(&env, "Beagle"),
+        &String::from_str(&env, "Tricolor"),
+        &13u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    assert!(updated);
 }

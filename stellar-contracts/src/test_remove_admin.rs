@@ -93,3 +93,18 @@ fn test_remove_admin_threshold_one() {
     let proposal_id = client.remove_admin(&admin1, &admin2);
     assert!(proposal_id > 0);
 }
+
+// Rejection when proposing removal of an address that is not an admin (#222).
+#[test]
+fn test_remove_admin_not_in_admin_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin1, _admin2, _admin3) = setup_multisig(&env);
+    let non_admin = Address::generate(&env);
+
+    let result = client.try_remove_admin(&admin1, &non_admin);
+    assert!(result.is_err());
+    let err = result.unwrap_err().unwrap();
+    assert_eq!(err, ContractError::InvalidInput.into());
+}
