@@ -939,6 +939,16 @@ pub struct EmergencyAccessLog {
     pub timestamp: u64,
 }
 
+/// Paginated result for emergency access logs (issue #116).
+#[contracttype]
+#[derive(Clone)]
+pub struct EmergencyAccessLogsPage {
+    pub items: Vec<EmergencyAccessLog>,
+    pub total: u64,
+    pub page: u32,
+    pub page_size: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuditEntry {
@@ -11452,27 +11462,51 @@ impl KoraContract {
         env: Env,
         pet_id: u64,
         caller: Address,
-    ) -> Vec<EmergencyAccessLog> {
+        page: u32,
+        page_size: u32,
+    ) -> EmergencyAccessLogsPage {
+        if page_size == 0 || page_size > 50 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
         // Verify pet exists
-        if let Some(pet) = env
+        let pet: Pet = env
             .storage()
             .instance()
             .get::<_, Pet>(&DataKey::Pet(pet_id))
-        {
-            // Require owner authorization
-            if caller != pet.owner {
-                panic_with_error!(&env, ContractError::NotPetOwner);
-            }
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PetNotFound));
 
-            // Retrieve logs from persistent storage
-            let log_key = DataKey::EmergencyAccessLogs(pet_id);
-            env.storage()
-                .persistent()
-                .get(&log_key)
-                .unwrap_or(Vec::new(&env))
-        } else {
-            panic_with_error!(&env, ContractError::PetNotFound);
+        // Require owner authorization
+        if caller != pet.owner {
+            panic_with_error!(&env, ContractError::NotPetOwner);
         }
+
+        // Retrieve all logs from persistent storage
+        let log_key = DataKey::EmergencyAccessLogs(pet_id);
+        let all_logs: Vec<EmergencyAccessLog> = env
+            .storage()
+            .persistent()
+            .get(&log_key)
+            .unwrap_or(Vec::new(&env));
+
+        let total = all_logs.len() as u64;
+        let mut items = Vec::new(&env);
+
+        if total == 0 {
+            return EmergencyAccessLogsPage { items, total, page, page_size };
+        }
+
+        let offset = (page as u64).saturating_mul(page_size as u64);
+        if offset >= total {
+            return EmergencyAccessLogsPage { items, total, page, page_size };
+        }
+
+        let end = (offset + page_size as u64).min(total);
+        for i in offset..end {
+            items.push_back(all_logs.get(i as u32).unwrap());
+        }
+
+        EmergencyAccessLogsPage { items, total, page, page_size }
     }
 
     // --- DISPUTE RESOLUTION ---
@@ -14119,6 +14153,25 @@ impl KoraContract {
     ) -> u64 {
         if sire_id == dam_id {
             panic_with_error!(&env, ContractError::SelfBreeding);
+        }
+
+        // Verify both pets exist and are active/non-archived (#121)
+        let sire: Pet = env
+            .storage()
+            .instance()
+            .get::<_, Pet>(&DataKey::Pet(sire_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PetNotFound));
+        let dam: Pet = env
+            .storage()
+            .instance()
+            .get::<_, Pet>(&DataKey::Pet(dam_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PetNotFound));
+
+        if sire.archived || dam.archived {
+            panic_with_error!(&env, ContractError::PetIsArchived);
+        }
+        if !sire.active || !dam.active {
+            panic_with_error!(&env, ContractError::InvalidInput);
         }
 
         let coi = Self::calc_coi(&env, sire_id, dam_id);
