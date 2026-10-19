@@ -60,7 +60,7 @@ fn test_unanimous_approval_auto_resolves_in_favor_of_claimer() {
     );
     assert_eq!(
         client.get_dispute(&dispute_id).unwrap().status,
-        DisputeStatus::Pending
+        DisputeStatus::Open
     );
 
     let resolved_by_admin = client.vote_on_dispute(&admin, &dispute_id, &DisputeVote::Approve);
@@ -91,7 +91,7 @@ fn test_split_vote_does_not_resolve_dispute() {
     assert!(!r2);
 
     let dispute = client.get_dispute(&dispute_id).unwrap();
-    assert_eq!(dispute.status, DisputeStatus::Pending);
+    assert_eq!(dispute.status, DisputeStatus::Open);
     assert!(dispute.resolved_at.is_none());
 
     let votes = client.get_dispute_votes(&dispute_id);
@@ -110,16 +110,32 @@ fn test_split_vote_does_not_resolve_dispute() {
 
 #[test]
 fn test_admin_override_resolves_without_votes() {
-    let (_env, client, admin, owner, _target, dispute_id) = setup();
+    let (env, client, admin, owner, target, dispute_id) = setup();
 
     // Owner casts a single vote; threshold is not met.
     client.vote_on_dispute(&owner, &dispute_id, &DisputeVote::Approve);
     assert_eq!(
         client.get_dispute(&dispute_id).unwrap().status,
-        DisputeStatus::Pending
+        DisputeStatus::Open
     );
 
-    // Admin override bypasses the consensus mechanism entirely.
+    // Issue #294: resolve_dispute requires UnderReview status. Transition the
+    // dispute through EvidencePhase → UnderReview before calling the override.
+    let arbitrator = Address::generate(&env);
+    client.assign_arbitrator(&admin, &arbitrator);
+
+    client.submit_evidence(
+        &dispute_id,
+        &target,
+        &String::from_str(&env, "ipfs://evidence"),
+    );
+    client.start_review(&dispute_id, &arbitrator);
+    assert_eq!(
+        client.get_dispute(&dispute_id).unwrap().status,
+        DisputeStatus::UnderReview
+    );
+
+    // Admin override bypasses the consensus mechanism.
     let overridden = client.resolve_dispute(&dispute_id, &DisputeStatus::ResolvedInFavorOfTarget);
     assert!(overridden);
 

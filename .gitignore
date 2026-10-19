@@ -2,11 +2,41 @@
 target/
 stellar-contracts/target/
 
+# Dependency lockfiles (generated, not committed at root level)
 # Cargo lock files (workspace-level kept, sub-crate excluded)
 stellar-contracts/Cargo.lock
 
 # Test snapshots (proptest / insta)
 test_snapshots/
+**/*.snap
+**/*.snap.new
+*.snap
+*.snap.new
+
+# Celo / Node
+node_modules/
+celo-contracts/artifacts/
+celo-contracts/cache/
+celo-contracts/typechain-types/
+
+# Secrets & environment
+.env
+.env.*
+
+# Foundry cache
+.snfoundry_cache/
+
+# Editor / OS artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Misc project-specific
+ISSUES.md
+somzilla.md
 **/test_snapshots/
 **/*.snap
 **/*.snap.new

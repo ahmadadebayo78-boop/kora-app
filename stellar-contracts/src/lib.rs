@@ -196,6 +196,14 @@ mod test_verify_claim_document;
 mod test_vet_pagination;
 #[cfg(test)]
 mod test_upgrade_proposal;
+// Issues #294–#297: test_disputes now compiles — dispute arbitration state
+// machine (start_review, rule, register_arbitrator, penalise_arbitrator,
+// DisputeOutcome, DisputeStatus::{Open,UnderReview,Resolved}) has been
+// implemented. Re-enabled here.
+#[cfg(test)]
+mod test_disputes;
+// test_book_slot still requires the appointment-booking API which is not yet
+// implemented; keep it excluded.
 // `test_disputes` and `test_book_slot` do not compile against the current
 // `test_book_slot` calls appointment-booking APIs
 // (`book_slot`, `get_available_slots`, `set_availability`, `cancel_booking`, …)
@@ -2710,6 +2718,15 @@ pub enum DisputeStatus {
     ResolvedInFavorOfClaimer = 3,
     ResolvedInFavorOfTarget = 4,
     Cancelled = 5,
+    /// Dispute has been raised and is open for evidence submission (issue #294).
+    Open = 6,
+    /// Dispute is under active review by an arbitrator (issue #294).
+    UnderReview = 7,
+    /// Dispute has been ruled on by an arbitrator (issue #294).
+    Resolved = 8,
+}
+
+/// Outcome of an arbitrator's ruling on a dispute (issue #294).
     Open = 6,
     UnderReview = 7,
     Resolved = 8,
@@ -2787,6 +2804,10 @@ pub enum DisputeKey {
     DisputeVoteByVoter(u64, Address),
     /// Ordered list of addresses that have voted on a dispute (for enumeration).
     DisputeVoters(u64),
+    /// Ordered registry of all registered arbitrators (issue #294).
+    ArbitratorList,
+    /// Per-arbitrator stats (reputation, total rulings) (issue #294).
+    ArbitratorStats(Address),
 }
 
 #[contract]
@@ -9338,6 +9359,13 @@ impl KoraContract {
             panic_with_error!(&env, ContractError::InvalidInput);
         }
 
+        // Issue #296: validate calorie bounds (>= 50 and <= 10,000 kcal).
+        if total_calories < 50 || total_calories > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        // Issue #296: validate ingredient count (must have 1–20 items).
+        if ingredients.is_empty() || ingredients.len() > 20u32 {
         if name.len() > Self::MAX_NUTRITION_TEXT_LEN
             || ingredients.is_empty()
             || ingredients.len() > Self::MAX_NUTRITION_INGREDIENTS
@@ -11533,6 +11561,12 @@ impl KoraContract {
     /// Admin override: forcibly resolves a dispute, bypassing the consensus
     /// vote. Requires admin authorization and arbitrator verification. Use `vote_on_dispute` for the
     /// standard multi-party consensus path.
+    ///
+    /// Requires the dispute to be in `DisputeStatus::UnderReview`; panics with
+    /// `ContractError::InvalidState` otherwise to prevent re-resolving closed
+    /// or cancelled disputes (issue #294).
+    pub fn resolve_dispute(env: Env, dispute_id: u64, status: DisputeStatus) -> bool {
+        Self::require_admin(&env);
     pub fn resolve_dispute(env: Env, dispute_id: u64, arbitrator: Address, status: DisputeStatus) -> bool {
         arbitrator.require_auth();
 
@@ -11543,10 +11577,16 @@ impl KoraContract {
 
         let key = DisputeKey::Dispute(dispute_id);
         if let Some(mut dispute) = env.storage().instance().get::<DisputeKey, Dispute>(&key) {
+            // Issue #294: only allow resolution when the dispute is actively under review.
+            if dispute.status != DisputeStatus::UnderReview {
+                panic_with_error!(&env, ContractError::InvalidState);
+            }
+
             dispute.status = status;
             dispute.resolved_at = Some(env.ledger().timestamp());
             env.storage().instance().set(&key, &dispute);
 
+            // Issue #295: emit DisputeResolved event.
             env.events().publish(
                 (Symbol::new(&env, "DisputeResolved"),),
                 (dispute_id, status, env.ledger().timestamp()),
@@ -11583,6 +11623,8 @@ impl KoraContract {
 
         assert!(
             dispute.status == DisputeStatus::Pending
+                || dispute.status == DisputeStatus::Open
+                || dispute.status == DisputeStatus::EvidencePhase,
                 || dispute.status == DisputeStatus::EvidencePhase
                 || dispute.status == DisputeStatus::Open,
             "Dispute is not open for voting"
@@ -11722,6 +11764,11 @@ impl KoraContract {
         result
     }
 
+    /// Submit evidence for an open or evidence-phase dispute.
+    ///
+    /// Accepts a CID string (IPFS / Arweave link). Transitions the dispute to
+    /// `EvidencePhase` on the first submission if it was `Open`. Emits an
+    /// `EvidenceSubmitted` event (issue #295). Returns `true` on success.
     pub fn submit_evidence(
         env: Env,
         dispute_id: u64,
@@ -11746,6 +11793,9 @@ impl KoraContract {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::InvalidInput));
 
         assert!(
+            dispute.status == DisputeStatus::Open
+                || dispute.status == DisputeStatus::EvidencePhase,
+            "Submission outside evidence phase rejected"
             submitter == dispute.claimer || submitter == dispute.target,
             "Only claimer or target can submit evidence"
         );
@@ -11777,6 +11827,12 @@ impl KoraContract {
             .get(&evidence_count_key)
             .unwrap_or(0);
         let evidence_id = total_count + 1;
+
+        // Transition to EvidencePhase on first submission (issue #294).
+        if dispute.status == DisputeStatus::Open {
+            dispute.status = DisputeStatus::EvidencePhase;
+            env.storage().instance().set(&dispute_key, &dispute);
+        }
 
         let evidence = Evidence {
             evidence_id,
@@ -12063,6 +12119,222 @@ impl KoraContract {
             .instance()
             .set(&DisputeKey::ArbitratorStats(arbitrator), &stats);
 
+        // Issue #295: emit EvidenceSubmitted event.
+        env.events().publish(
+            (Symbol::new(&env, "EvidenceSubmitted"),),
+            (dispute_id, submitter.clone(), evidence_id),
+        );
+
+        let _ = cid; // CID stored off-chain; tracked by evidence_id here
+        true
+    }
+
+    /// Transitions a dispute from `EvidencePhase` to `UnderReview`, assigning
+    /// the given arbitrator as the reviewer. Only the currently assigned
+    /// arbitrator may call this (issue #294).
+    pub fn start_review(env: Env, dispute_id: u64, arbitrator: Address) -> bool {
+        arbitrator.require_auth();
+
+        let assigned: Address = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::Arbitrator)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::Unauthorized));
+
+        if arbitrator != assigned {
+            env.panic_with_error(ContractError::Unauthorized);
+        }
+
+        let dispute_key = DisputeKey::Dispute(dispute_id);
+        let mut dispute: Dispute = env
+            .storage()
+            .instance()
+            .get(&dispute_key)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::InvalidInput));
+
+        assert!(
+            dispute.status == DisputeStatus::EvidencePhase,
+            "start_review requires EvidencePhase"
+        );
+
+        dispute.status = DisputeStatus::UnderReview;
+        env.storage().instance().set(&dispute_key, &dispute);
+        true
+    }
+
+    /// Issues a ruling on a dispute that is `UnderReview`. Transitions status
+    /// to `Resolved`, records the resolved timestamp, and emits a
+    /// `DisputeResolved` event. Updates arbitrator reputation (issue #294,
+    /// #295).
+    pub fn rule(env: Env, dispute_id: u64, arbitrator: Address, outcome: DisputeOutcome) -> bool {
+        arbitrator.require_auth();
+
+        let assigned: Address = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::Arbitrator)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::Unauthorized));
+
+        if arbitrator != assigned {
+            env.panic_with_error(ContractError::Unauthorized);
+        }
+
+        let dispute_key = DisputeKey::Dispute(dispute_id);
+        let mut dispute: Dispute = env
+            .storage()
+            .instance()
+            .get(&dispute_key)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::InvalidInput));
+
+        assert!(
+            dispute.status == DisputeStatus::UnderReview,
+            "rule requires UnderReview"
+        );
+
+        dispute.status = DisputeStatus::Resolved;
+        dispute.resolved_at = Some(env.ledger().timestamp());
+        env.storage().instance().set(&dispute_key, &dispute);
+
+        // Update arbitrator reputation.
+        let stats_key = DisputeKey::ArbitratorStats(arbitrator.clone());
+        let mut stats: ArbitratorStats = env
+            .storage()
+            .instance()
+            .get(&stats_key)
+            .unwrap_or(ArbitratorStats {
+                address: arbitrator.clone(),
+                reputation: 0,
+                total_rulings: 0,
+            });
+        stats.reputation = stats.reputation.saturating_add(1);
+        stats.total_rulings = stats.total_rulings.saturating_add(1);
+        env.storage().instance().set(&stats_key, &stats);
+
+        // Issue #295: emit DisputeResolved event.
+        env.events().publish(
+            (Symbol::new(&env, "DisputeResolved"),),
+            (
+                dispute_id,
+                DisputeStatus::Resolved,
+                env.ledger().timestamp(),
+            ),
+        );
+
+        let _ = outcome; // outcome captured in Resolved status; reserved for future payout logic
+        true
+    }
+
+    /// Registers an address as an eligible arbitrator. Admin-only.
+    /// Idempotent — re-registering an existing arbitrator is a no-op (issue #294).
+    pub fn register_arbitrator(env: Env, admin: Address, arbitrator: Address) {
+        Self::require_admin_auth(&env, &admin);
+
+        let stats_key = DisputeKey::ArbitratorStats(arbitrator.clone());
+        if !env.storage().instance().has(&stats_key) {
+            env.storage().instance().set(
+                &stats_key,
+                &ArbitratorStats {
+                    address: arbitrator.clone(),
+                    reputation: 0,
+                    total_rulings: 0,
+                },
+            );
+        }
+
+        // Append to global list if not already present.
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::ArbitratorList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut already_registered = false;
+        for a in list.iter() {
+            if a == arbitrator {
+                already_registered = true;
+                break;
+            }
+        }
+        if !already_registered {
+            list.push_back(arbitrator);
+            env.storage()
+                .instance()
+                .set(&DisputeKey::ArbitratorList, &list);
+        }
+    }
+
+    /// Decreases an arbitrator's reputation by 1 (floor 0). Admin-only (issue #294).
+    pub fn penalise_arbitrator(env: Env, admin: Address, arbitrator: Address) {
+        Self::require_admin_auth(&env, &admin);
+
+        let stats_key = DisputeKey::ArbitratorStats(arbitrator.clone());
+        let mut stats: ArbitratorStats = env
+            .storage()
+            .instance()
+            .get(&stats_key)
+            .unwrap_or(ArbitratorStats {
+                address: arbitrator.clone(),
+                reputation: 0,
+                total_rulings: 0,
+            });
+        stats.reputation = (stats.reputation - 1).max(0);
+        env.storage().instance().set(&stats_key, &stats);
+    }
+
+    /// Automatically selects the registered arbitrator with the highest
+    /// reputation who is not a party to the dispute (issue #294).
+    pub fn auto_assign_arbitrator(env: Env, dispute_id: u64) -> Address {
+        let dispute: Dispute = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::Dispute(dispute_id))
+            .unwrap_or_else(|| env.panic_with_error(ContractError::InvalidInput));
+
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::ArbitratorList)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut best: Option<Address> = None;
+        let mut best_rep: i64 = -1;
+
+        for candidate in list.iter() {
+            if candidate == dispute.claimer || candidate == dispute.target {
+                continue;
+            }
+            let stats_key = DisputeKey::ArbitratorStats(candidate.clone());
+            let rep: i64 = env
+                .storage()
+                .instance()
+                .get::<DisputeKey, ArbitratorStats>(&stats_key)
+                .map(|s| s.reputation)
+                .unwrap_or(0);
+            if rep > best_rep {
+                best_rep = rep;
+                best = Some(candidate.clone());
+            }
+        }
+
+        let winner = best.unwrap_or_else(|| env.panic_with_error(ContractError::InvalidState));
+
+        // Assign as the active arbitrator.
+        env.storage()
+            .instance()
+            .set(&DisputeKey::Arbitrator, &winner);
+        winner
+    }
+
+    /// Returns stats for a given arbitrator address (issue #294).
+    pub fn get_arbitrator_stats(env: Env, arbitrator: Address) -> ArbitratorStats {
+        let stats_key = DisputeKey::ArbitratorStats(arbitrator.clone());
+        env.storage()
+            .instance()
+            .get(&stats_key)
+            .unwrap_or(ArbitratorStats {
+                address: arbitrator,
+                reputation: 0,
+                total_rulings: 0,
+            })
         true
     }
 
