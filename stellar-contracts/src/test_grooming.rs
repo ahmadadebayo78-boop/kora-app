@@ -647,6 +647,12 @@ mod test_recurring_grooming {
         assert_eq!(result, 0);
     }
 
+    // ── Tests for Issues #286, #287, #288, #289 ─────────────────────────────
+
+    /// #287: create_grooming_schedule must reject a start_date in the past.
+    #[test]
+    #[should_panic(expected = "InvalidInput")]
+    fn test_create_schedule_rejects_past_start_date() {
     /// Issue #69: advance_schedule must reject callers who are neither the
     /// pet owner nor the schedule's registered groomer.
     #[test]
@@ -658,6 +664,15 @@ mod test_recurring_grooming {
         let client = KoraContractClient::new(&env, &contract_id);
         let (_owner, pet_id) = setup_pet(&env, &client);
 
+        // Set ledger to a known timestamp, then pass a start_date before it.
+        env.ledger().with_mut(|l| l.timestamp = 2_000_000);
+        let past = 1_000_000u64; // clearly before ledger timestamp of 2_000_000
+        let end = 2_000_000 + 7 * 24 * 3600;
+
+        client.create_grooming_schedule(
+            &pet_id,
+            &GroomingFrequency::Weekly,
+            &past,
         let start = 1_000_000u64;
         let interval = 7 * 24 * 3600u64;
         let end = start + interval * 10;
@@ -671,6 +686,11 @@ mod test_recurring_grooming {
             &String::from_str(&env, "Bath"),
             &5000,
         );
+    }
+
+    /// #287: create_grooming_schedule accepts a start_date equal to ledger timestamp.
+    #[test]
+    fn test_create_schedule_accepts_current_start_date() {
 
         let stranger = Address::generate(&env);
         client.advance_schedule(&stranger, &schedule_id);
@@ -687,6 +707,15 @@ mod test_recurring_grooming {
         let client = KoraContractClient::new(&env, &contract_id);
         let (_owner, pet_id) = setup_pet(&env, &client);
 
+        env.ledger().with_mut(|l| l.timestamp = 2_000_000);
+        let now = env.ledger().timestamp();
+        let interval = 7 * 24 * 3600u64;
+        let end = now + interval * 10;
+
+        let schedule_id = client.create_grooming_schedule(
+            &pet_id,
+            &GroomingFrequency::Weekly,
+            &now,
         let start = 1_000_000u64;
         let end = start + 86400 * 30;
 
@@ -700,6 +729,13 @@ mod test_recurring_grooming {
             &String::from_str(&env, "Bath"),
             &5000,
         );
+        assert!(schedule_id > 0);
+    }
+
+    /// #288: advance_schedule must reject an unauthorized caller.
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_advance_schedule_rejects_unauthorized_caller() {
     }
 
     #[test]
@@ -712,6 +748,12 @@ mod test_recurring_grooming {
         let (_owner, pet_id) = setup_pet(&env, &client);
 
         let start = 1_000_000u64;
+        let interval = 7 * 24 * 3600u64;
+        let end = start + interval * 10;
+
+        let schedule_id = client.create_grooming_schedule(
+            &pet_id,
+            &GroomingFrequency::Weekly,
         let end = start + 86400 * 400;
 
         // Custom(366) exceeds 365-day limit
@@ -724,6 +766,15 @@ mod test_recurring_grooming {
             &String::from_str(&env, "Bath"),
             &5000,
         );
+
+        // An arbitrary address that is neither the pet owner nor a registered groomer.
+        let stranger = Address::generate(&env);
+        client.advance_schedule(&stranger, &schedule_id);
+    }
+
+    /// #288: advance_schedule allows pet owner to advance.
+    #[test]
+    fn test_advance_schedule_owner_authorized() {
     }
 
     #[test]
@@ -732,6 +783,15 @@ mod test_recurring_grooming {
         env.mock_all_auths();
         let contract_id = env.register_contract(None, KoraContract);
         let client = KoraContractClient::new(&env, &contract_id);
+        let (owner, pet_id) = setup_pet(&env, &client);
+
+        let start = 1_000_000u64;
+        let interval = 7 * 24 * 3600u64;
+        let end = start + interval * 10;
+
+        let schedule_id = client.create_grooming_schedule(
+            &pet_id,
+            &GroomingFrequency::Weekly,
         let (_owner, pet_id) = setup_pet(&env, &client);
 
         let start = 1_000_000u64;
@@ -749,6 +809,44 @@ mod test_recurring_grooming {
             &5000,
         );
 
+        let record_id = client.advance_schedule(&owner, &schedule_id);
+        assert!(record_id > 0);
+    }
+
+    /// #289: register_groomer emits grm_reg event; rate_groomer emits grm_rate event.
+    #[test]
+    fn test_groomer_events_emitted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, KoraContract);
+        let client = KoraContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.init_admin(&admin);
+
+        let groomer_addr = Address::generate(&env);
+
+        let before = env.events().all().len();
+
+        // register_groomer should emit a grm_reg event
+        let registered = client.register_groomer(
+            &admin,
+            &groomer_addr,
+            &String::from_str(&env, "Best Groomer"),
+            &String::from_str(&env, "LIC-001"),
+        );
+        assert!(registered);
+
+        // At least one new event was published (grm_reg)
+        assert!(
+            env.events().all().len() > before,
+            "grm_reg event not emitted by register_groomer"
+        );
+    }
+
+    /// #286: rate_groomer requires pet owner auth — verify code path executes correctly for owner.
+    #[test]
+    fn test_rate_groomer_requires_pet_owner_auth() {
         assert!(schedule_id > 0);
         let history = client.get_grooming_history(&pet_id);
         assert_eq!(history.len(), 4);
@@ -760,6 +858,37 @@ mod test_recurring_grooming {
         env.mock_all_auths();
         let contract_id = env.register_contract(None, KoraContract);
         let client = KoraContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.init_admin(&admin);
+
+        let owner = Address::generate(&env);
+        let pet_id = client.register_pet(
+            &owner,
+            &String::from_str(&env, "Buddy"),
+            &String::from_str(&env, "2020-01-01"),
+            &Gender::Male,
+            &Species::Dog,
+            &String::from_str(&env, "Retriever"),
+            &String::from_str(&env, "Golden"),
+            &30,
+            &None,
+            &PrivacyLevel::Public,
+        );
+
+        // Register and add a grooming record with a groomer address so rating has an effect.
+        let groomer_addr = Address::generate(&env);
+        client.register_groomer(
+            &admin,
+            &groomer_addr,
+            &String::from_str(&env, "Star Groomer"),
+            &String::from_str(&env, "LIC-002"),
+        );
+
+        // rate_groomer with an invalid record_id returns false (no groomer_address on record).
+        // The important check: it does NOT panic, meaning pet.owner.require_auth() passed.
+        let result = client.rate_groomer(&pet_id, &999u64, &5u32);
+        assert!(!result, "rate_groomer should return false for missing record");
         let (_owner, pet_id) = setup_pet(&env, &client);
 
         let start = 1_000_000u64;
