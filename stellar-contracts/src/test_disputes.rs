@@ -5,7 +5,7 @@ fn setup() -> (Env, KoraContractClient<'static>, Address, Address, Address, Addr
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register_contract(None, KoraContract);
+    let contract_id = env.register(KoraContract, ());
     let client = KoraContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
@@ -39,11 +39,17 @@ fn raise(
     client: &KoraContractClient,
     env: &Env,
     pet_id: u64,
+    owner: &Address,
     claimer: &Address,
     target: &Address,
 ) -> u64 {
     client.raise_dispute(
         &pet_id,
+        owner,
+        target,
+        &1_000u64,
+        &String::from_str(env, "Dispute reason"),
+        &String::from_str(env, "ipfs://initial"),
         claimer,
         target,
         &500u64,
@@ -108,6 +114,27 @@ fn test_submit_evidence_and_review_flow() {
     let resolved = client.get_dispute(&dispute_id).unwrap();
     assert_eq!(resolved.status, DisputeStatus::Resolved);
     assert_eq!(resolved.resolved_at, Some(1_000));
+}
+
+/// Issue #294 acceptance criterion: resolve_dispute must panic when the dispute
+/// is not in UnderReview status (e.g., already Resolved).
+#[test]
+#[should_panic]
+fn test_resolve_resolved_dispute_panics() {
+    let (env, client, _admin, owner, target, arbitrator, pet_id) = setup();
+
+    // Raise → evidence → start_review → rule (Resolved)
+    let dispute_id = raise(&client, &env, pet_id, &owner, &target);
+    client.submit_evidence(
+        &dispute_id,
+        &target,
+        &String::from_str(&env, "ipfs://evidence"),
+    );
+    client.start_review(&dispute_id, &arbitrator);
+    client.rule(&dispute_id, &arbitrator, &DisputeOutcome::InFavorOfClaimer);
+
+    // Attempt to resolve an already-Resolved dispute — must panic.
+    client.resolve_dispute(&dispute_id, &DisputeStatus::ResolvedInFavorOfTarget);
 }
 
 // --- Reputation-based arbitrator tests ---

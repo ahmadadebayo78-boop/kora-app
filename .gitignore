@@ -2,47 +2,48 @@
 target/
 stellar-contracts/target/
 
-# Cargo lock (root workspace manages it; individual crates excluded)
+# Dependency lockfiles (generated, not committed at root level)
 # Cargo lock files (workspace-level kept, sub-crate excluded)
 stellar-contracts/Cargo.lock
 
 # Test snapshots (proptest / insta)
 test_snapshots/
-test_snapshots/test/test
 **/*.snap
 **/*.snap.new
+*.snap
+*.snap.new
 
-# Starknet / Foundry cache
+# Celo / Node
+node_modules/
+celo-contracts/artifacts/
+celo-contracts/cache/
+celo-contracts/typechain-types/
+
+# Secrets & environment
+.env
+.env.*
+
+# Foundry cache
 .snfoundry_cache/
 
-# JavaScript / Node
-node_modules/
-.env
-
-# IDE / editor
-.vscode/
-.idea/
-*.iml
+# Editor / OS artifacts
 .DS_Store
+Thumbs.db
 *.swp
 *.swo
+.idea/
+.vscode/
 
-# Secrets and local config
-*.pem
-*.key
-secrets/
-somzilla.md
+# Misc project-specific
 ISSUES.md
-
-# Coverage reports
-coverage/
-*.profraw
-*.profdata
-lcov.info
-cobertura.xml
+somzilla.md
 **/test_snapshots/
 **/*.snap
 **/*.snap.new
+
+# Proptest regression state directories
+proptest-regressions/
+**/.proptest-regressions/
 
 # Environment / secrets
 .env

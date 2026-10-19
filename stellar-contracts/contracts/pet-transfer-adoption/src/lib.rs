@@ -77,6 +77,10 @@ pub struct PendingTransfer {
 pub const DEFAULT_TRANSFER_TIMEOUT_SECONDS: u64 = 7 * 24 * 60 * 60; // 604 800 s
 pub const MAX_TRANSFER_TIMEOUT_DAYS: u32 = 90;
 
+/// Maximum adoption waiting period (in days). Prevents unreasonably long
+/// adoption waiting periods. (Issue #249)
+pub const MAX_ADOPTION_WAITING_PERIOD_DAYS: u32 = 365;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnershipRecord {
@@ -170,6 +174,15 @@ pub const MAX_OWNERSHIP_HISTORY_LEN: u32 = 512;
 
 /// Maximum length for a rejection reason string.
 pub const MAX_REJECTION_REASON_LEN: u32 = 256;
+
+/// Maximum length for a waiver reason string (Issue #245).
+pub const MAX_WAIVER_REASON_LEN: u32 = 256;
+
+/// Maximum adoption waiting period in days (Issue #244).
+pub const MAX_ADOPTION_WAITING_PERIOD_DAYS: u32 = 365;
+
+/// Maximum limit for list pagination (Issue #242).
+pub const MAX_PAGINATION_LIMIT: u32 = 1000;
 
 fn validate_len(env: &Env, s: &String, max: u32) {
     if s.len() > max {
@@ -573,9 +586,14 @@ impl PetOwnershipContract {
     /// Set the global adoption waiting period (in days).
     /// Only configurable if no default config has been set yet.
     /// The caller is stored as the adoption admin for future `update_adoption_config` calls.
+    /// Emits an `AdoptionConfigUpdated` event.
+    /// Issue #249: validates that waiting_period_days does not exceed MAX_ADOPTION_WAITING_PERIOD_DAYS.
     pub fn set_adoption_config(env: Env, waiting_period_days: u32, admin: Address) {
         if env.storage().persistent().has(&DataKey::AdoptionConfig) {
             panic_with_error!(&env, ContractError::AdoptionNotConfigurable);
+        }
+        if waiting_period_days > MAX_ADOPTION_WAITING_PERIOD_DAYS {
+            panic_with_error!(&env, ContractError::InvalidWaitingPeriod);
         }
         admin.require_auth();
         let config = AdoptionConfig {
@@ -586,15 +604,24 @@ impl PetOwnershipContract {
             .persistent()
             .set(&DataKey::AdoptionConfig, &config);
         env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.events().publish(
+            (Symbol::new(&env, "cfg_adoption"),),
+            (0u32, waiting_period_days),
+        );
     }
 
     /// Update the global adoption waiting period (in days).
     /// Only callable by the admin stored during `set_adoption_config`.
     /// Emits an `AdoptionConfigUpdated` event with old and new values.
+    /// Issue #249: validates that waiting_period_days does not exceed MAX_ADOPTION_WAITING_PERIOD_DAYS.
     /// Closes issue #1007.
     pub fn update_adoption_config(env: Env, waiting_period_days: u32) {
         let admin: Address = get_adoption_admin(&env);
         admin.require_auth();
+
+        if waiting_period_days > MAX_ADOPTION_WAITING_PERIOD_DAYS {
+            panic_with_error!(&env, ContractError::InvalidWaitingPeriod);
+        }
 
         let old_config: AdoptionConfig = env
             .storage()
@@ -632,9 +659,15 @@ impl PetOwnershipContract {
 
     /// Set a per-species adoption waiting period override.
     /// Only callable by the admin stored during `set_adoption_config`.
+    /// Issue #244: Enforces maximum waiting period to prevent accidental lockout.
     pub fn set_species_adoption_config(env: Env, species: String, waiting_period_days: u32) {
         let admin: Address = get_adoption_admin(&env);
         admin.require_auth();
+
+        if waiting_period_days > MAX_ADOPTION_WAITING_PERIOD_DAYS {
+            panic_with_error!(&env, ContractError::InvalidWaitingPeriod);
+        }
+
         env.storage().persistent().set(
             &DataKey::SpeciesAdoptionConfig(species),
             &waiting_period_days,
@@ -642,12 +675,30 @@ impl PetOwnershipContract {
     }
 
     /// Sign an adoption agreement, entering the waiting period.
+    /// Issue #247: Blocks adoption if there's an active (unresolved) custody dispute.
+    /// Issue #246: Validates that organization address doesn't match owner or adopter.
     pub fn sign_adoption(env: Env, pet_id: u64, to: Address, organization: Option<Address>) {
         let pet = get_pet(&env, pet_id);
         pet.current_owner.require_auth();
 
         if pet.current_owner == to {
             panic_with_error!(&env, ContractError::InvalidRecipient);
+        }
+
+        if let Some(ref org) = organization {
+            if &pet.current_owner == org || &to == org {
+                panic_with_error!(&env, ContractError::InvalidRecipient);
+            }
+        }
+
+        if let Some(escrowed) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, EscrowedTransfer>(&DataKey::EscrowedTransfer(pet_id))
+        {
+            if escrowed.disputed {
+                panic_with_error!(&env, ContractError::TransferDisputed);
+            }
         }
 
         if env
@@ -1009,8 +1060,10 @@ impl PetOwnershipContract {
     }
 
     /// Allow a multisig admin to waive the waiting period for a specific adoption.
+    /// Issue #245: Validates reason string length to prevent storage bloat.
     pub fn waive_waiting_period(env: Env, pet_id: u64, admin: Address, reason: String) {
         admin.require_auth();
+        validate_len(&env, &reason, MAX_WAIVER_REASON_LEN);
         // Verify the caller is a registered multisig admin. (Issue #128)
         require_trusted_multisig_admin(&env, &admin);
         let pending: PendingAdoption = env
@@ -1514,6 +1567,7 @@ impl PetOwnershipContract {
     /// Transfer multiple pets to the same new owner atomically.
     /// All pets must be owned by the same caller and the batch is rejected
     /// if any pet is missing or owned by a different address.
+    /// Issue #250: Reject batch if any pet has pending transfer, active dispute, or pending adoption.
     pub fn batch_transfer(env: Env, pet_ids: Vec<u64>, to: Address) {
         const MAX_BATCH_SIZE: u32 = 20;
 
@@ -1540,6 +1594,27 @@ impl PetOwnershipContract {
                     panic_with_error!(env, ContractError::BatchOwnerMismatch);
                 }
                 _ => {}
+            }
+
+            // Check for pending transfers (prevents batch_transfer bypass)
+            if env.storage().persistent().has(&DataKey::PendingTransfer(pet_id)) {
+                panic_with_error!(&env, ContractError::TransferAlreadyPending);
+            }
+
+            // Check for active disputes (prevents batch_transfer bypass)
+            if let Some(escrowed) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, EscrowedTransfer>(&DataKey::EscrowedTransfer(pet_id))
+            {
+                if escrowed.disputed {
+                    panic_with_error!(&env, ContractError::TransferDisputed);
+                }
+            }
+
+            // Check for pending adoptions (prevents batch_transfer bypass)
+            if env.storage().persistent().has(&DataKey::PendingAdoption(pet_id)) {
+                panic_with_error!(&env, ContractError::TransferAlreadyPending);
             }
 
             pets.push_back(pet);
@@ -1602,16 +1677,41 @@ impl PetOwnershipContract {
         get_history(&env, pet_id)
     }
 
-    pub fn get_owner_pets(env: Env, owner: Address) -> Vec<u64> {
-        get_owner_pet_ids(&env, &owner)
+    /// Get paginated list of pet IDs owned by an address.
+    /// Issue #252: Pagination to prevent excessive gas consumption for large collections.
+    pub fn get_owner_pets(env: Env, owner: Address, offset: u64, limit: u32) -> Vec<u64> {
+        let all_pets = get_owner_pet_ids(&env, &owner);
+        let total = all_pets.len() as u64;
+
+        if offset >= total || limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let clamped_limit = limit.min(crate::MAX_PAGINATION_LIMIT);
+        let end = ((offset + clamped_limit as u64).min(total)) as usize;
+
+        all_pets.slice(offset as usize..end)
     }
 
-    /// Return the full chain-of-custody log for `pet_id` in chronological order.
-    pub fn get_custody_chain(env: Env, pet_id: u64) -> Vec<CustodyEntry> {
-        env.storage()
+    /// Return paginated chain-of-custody log for `pet_id` in chronological order.
+    /// Issue #251: Pagination to prevent memory bloat from frequently-traded pets.
+    pub fn get_custody_chain(env: Env, pet_id: u64, offset: u64, limit: u32) -> Vec<CustodyEntry> {
+        let full_chain: Vec<CustodyEntry> = env
+            .storage()
             .persistent()
             .get(&DataKey::CustodyChain(pet_id))
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = full_chain.len() as u64;
+
+        if offset >= total || limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let clamped_limit = limit.min(crate::MAX_PAGINATION_LIMIT);
+        let end = ((offset + clamped_limit as u64).min(total)) as usize;
+
+        full_chain.slice(offset as usize..end)
     }
 
     pub fn has_pending_transfer(env: Env, pet_id: u64) -> bool {
