@@ -159,7 +159,7 @@ fn test_vet_can_soft_delete_own_record() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[should_panic(expected = "Error(Contract, #160)")]
+#[should_panic(expected = "Error(Contract, #161)")]
 fn test_double_soft_delete_rejected() {
     let env = Env::default();
     let (client, vet, owner, pet_id) = setup(&env);
