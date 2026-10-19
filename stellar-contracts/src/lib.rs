@@ -4497,6 +4497,17 @@ impl KoraContract {
         if threshold == 0 || threshold > admins.len() {
             panic_with_error!(&env, ContractError::InvalidThreshold);
         }
+        if threshold > 255 {
+            panic_with_error!(&env, ContractError::InvalidThreshold);
+        }
+
+        let mut seen = Vec::new(&env);
+        for admin in admins.iter() {
+            if seen.contains(admin) {
+                panic_with_error!(&env, ContractError::InvalidInput);
+            }
+            seen.push_back(admin.clone());
+        }
 
         invoker.require_auth();
         if !admins.contains(invoker.clone()) {
@@ -14233,6 +14244,10 @@ impl KoraContract {
         env.storage()
             .instance()
             .set(&SystemKey::UpgradeProposalCount, &proposal_id);
+        env.events().publish(
+            (Symbol::new(&env, "UpgradeProposed"),),
+            (proposal_id, admin.clone(), new_wasm_hash),
+        );
         proposal_id
     }
 
@@ -14346,6 +14361,10 @@ impl KoraContract {
         env.storage()
             .instance()
             .set(&SystemKey::UpgradeProposal(proposal_id), &proposal);
+        env.events().publish(
+            (Symbol::new(&env, "UpgradeExecuted"),),
+            (proposal_id, proposal.new_wasm_hash),
+        );
     }
 
     pub fn get_upgrade_proposal(env: Env, proposal_id: u64) -> Option<UpgradeProposal> {
