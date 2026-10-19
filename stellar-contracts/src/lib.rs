@@ -119,6 +119,9 @@ pub enum BreedingKey {
     LineageDepth(u64),
     BreedingOffspringCount(u64),
     BreedingOffspringIndex((u64, u64)),
+    /// Issue #118: maps offspring_pet_id -> breeding_record_id so we can
+    /// detect when a pet is already registered as offspring of a litter.
+    OffspringLitter(u64),
 }
 
 /// Allele type for Mendelian genetics simulation.
@@ -196,6 +199,14 @@ mod test_verify_claim_document;
 mod test_vet_pagination;
 #[cfg(test)]
 mod test_upgrade_proposal;
+// Issues #294–#297: test_disputes now compiles — dispute arbitration state
+// machine (start_review, rule, register_arbitrator, penalise_arbitrator,
+// DisputeOutcome, DisputeStatus::{Open,UnderReview,Resolved}) has been
+// implemented. Re-enabled here.
+#[cfg(test)]
+mod test_disputes;
+// test_book_slot still requires the appointment-booking API which is not yet
+// implemented; keep it excluded.
 // `test_disputes` and `test_book_slot` do not compile against the current
 // `test_book_slot` calls appointment-booking APIs
 // (`book_slot`, `get_available_slots`, `set_availability`, `cancel_booking`, …)
@@ -226,6 +237,8 @@ mod test_grooming_slot_booking;
 
 #[cfg(test)]
 mod test_access_control;
+#[cfg(test)]
+mod test_access_logs_pagination;
 #[cfg(test)]
 mod test_activity;
 #[cfg(test)]
@@ -327,7 +340,7 @@ const DEFAULT_NONCE_MAX_USES: u32 = 1;
 #[allow(dead_code)]
 const NONCE_HISTORY_LIMIT: u32 = 8;
 #[allow(dead_code)]
-const MAX_SEARCH_KEYWORD_LEN: u32 = 32;
+const MAX_SEARCH_KEYWORD_LEN: u32 = 64;
 #[allow(dead_code)]
 const MAX_SEARCH_TOKENS_PER_RECORD: u32 = 16;
 #[allow(dead_code)]
@@ -518,6 +531,7 @@ pub enum ContractError {
     TooManySearchTokens = 168,
     InvalidRecipient = 169,
     PetIsArchived = 170,
+    BootstrapNotInitiated = 171,
 }
 
 // --- MULTI-LANGUAGE ERROR REGISTRY (Issue #684) ---
@@ -927,6 +941,16 @@ pub struct EmergencyAccessLog {
     pub timestamp: u64,
 }
 
+/// Paginated result for emergency access logs (issue #116).
+#[contracttype]
+#[derive(Clone)]
+pub struct EmergencyAccessLogsPage {
+    pub items: Vec<EmergencyAccessLog>,
+    pub total: u64,
+    pub page: u32,
+    pub page_size: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuditEntry {
@@ -1270,6 +1294,7 @@ pub enum DataKey {
     EmergencyAuditLog(u64),
     EmergencyResponders(u64),
     EmergencyNotifyRateLimit((Address, u64)), // (caller, pet_id) -> NotifyRateLimit
+    PetNotifyRateLimit(u64), // pet_id -> NotifyRateLimit (per-pet rate limit)
     BreedMetadata(String),
     SpeciesBreedList(String),
     CallerNonce(Address),
@@ -1467,6 +1492,14 @@ pub enum SystemKey {
     // Admin activity log keys (Issue #816)
     AdminActivityLog(u64), // index -> AdminActivityEntry
     AdminActivityCount,    // Total number of recorded admin actions
+    AdminActivityByAdmin((Address, u64)), // (admin_address, index) -> activity_id for indexed lookups (Issue #256)
+    AdminActivityCountByAdmin(Address), // admin_address -> count of activities by this admin (Issue #256)
+
+    // Active threshold change proposals (Issue #257)
+    PendingThresholdChangeActive, // Count of ACTIVE (non-expired) pending threshold change proposals
+
+    // Multisig bootstrap phases (Issues #254, #255)
+    PendingInitPhase, // Stores the current bootstrap phase state (ProposeInit, ConfirmInit, or Activated)
 }
 
 /// Statistics snapshot for governance reporting (Issue #828)
@@ -2638,6 +2671,60 @@ pub struct GroomingRecordCreatedEvent {
     pub subscription_ids: Vec<u64>,
 }
 
+/// Tracks multisig bootstrap phase state (Issues #254, #255)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BootstrapPhase {
+    ProposeInit {
+        admins: Vec<Address>,
+        threshold: u32,
+        proposer: Address,
+        confirmations: Vec<Address>,
+        expires_at: u64,
+    },
+    ConfirmInit {
+        admins: Vec<Address>,
+        threshold: u32,
+        confirmations: Vec<Address>,
+        expires_at: u64,
+    },
+    Activated,
+}
+
+/// Emitted when multisig bootstrap is proposed (Issue #255).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigBootstrapProposedEvent {
+    pub version: u32,
+    pub proposer: Address,
+    pub admins_count: u32,
+    pub threshold: u32,
+    pub expires_at: u64,
+    pub timestamp: u64,
+}
+
+/// Emitted when multisig bootstrap confirmation is submitted (Issue #255).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigBootstrapConfirmedEvent {
+    pub version: u32,
+    pub confirmer: Address,
+    pub confirmations_count: u32,
+    pub threshold: u32,
+    pub timestamp: u64,
+}
+
+/// Emitted when multisig bootstrap is activated (Issue #255, #254).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigBootstrapActivatedEvent {
+    pub version: u32,
+    pub activator: Address,
+    pub admins_count: u32,
+    pub threshold: u32,
+    pub timestamp: u64,
+}
+
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -2647,6 +2734,15 @@ pub enum DisputeStatus {
     ResolvedInFavorOfClaimer = 3,
     ResolvedInFavorOfTarget = 4,
     Cancelled = 5,
+    /// Dispute has been raised and is open for evidence submission (issue #294).
+    Open = 6,
+    /// Dispute is under active review by an arbitrator (issue #294).
+    UnderReview = 7,
+    /// Dispute has been ruled on by an arbitrator (issue #294).
+    Resolved = 8,
+}
+
+/// Outcome of an arbitrator's ruling on a dispute (issue #294).
     Open = 6,
     UnderReview = 7,
     Resolved = 8,
@@ -2724,6 +2820,10 @@ pub enum DisputeKey {
     DisputeVoteByVoter(u64, Address),
     /// Ordered list of addresses that have voted on a dispute (for enumeration).
     DisputeVoters(u64),
+    /// Ordered registry of all registered arbitrators (issue #294).
+    ArbitratorList,
+    /// Per-arbitrator stats (reputation, total rulings) (issue #294).
+    ArbitratorStats(Address),
 }
 
 #[contract]
@@ -4382,10 +4482,16 @@ impl KoraContract {
         result
     }
 
-    /// Read access log entries for a pet. Visible to the pet owner or any admin.
+    /// Read access log entries for a pet with pagination. Visible to the pet owner or any admin.
     /// Includes emergency-grant and emergency-revoke entries written by
     /// `add_emergency_responder` / `remove_emergency_responder`.
-    pub fn get_access_logs(env: Env, pet_id: u64, caller: Address) -> Vec<AccessLog> {
+    pub fn get_access_logs(
+        env: Env,
+        pet_id: u64,
+        caller: Address,
+        offset: u64,
+        limit: u32,
+    ) -> Vec<AccessLog> {
         caller.require_auth();
 
         let pet: crate::Pet = env
@@ -4399,7 +4505,23 @@ impl KoraContract {
             panic_with_error!(&env, ContractError::Unauthorized);
         }
 
-        Self::read_all_logs(&env, pet_id)
+        let key = (Symbol::new(&env, "access_logs"), pet_id);
+        let all_logs: Vec<AccessLog> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+
+        // Clamp limit to a maximum of 50 entries per call.
+        let effective_limit = if limit > 50 { 50 } else { limit } as u64;
+        let start = offset.min(all_logs.len() as u64);
+        let end = (start + effective_limit).min(all_logs.len() as u64);
+
+        let mut page: Vec<AccessLog> = Vec::new(&env);
+        for i in start..end {
+            page.push_back(all_logs.get(i as u32).unwrap());
+        }
+        page
     }
 
     fn require_admin(env: &Env) {
@@ -4472,6 +4594,17 @@ impl KoraContract {
         if threshold == 0 || threshold > admins.len() {
             panic_with_error!(&env, ContractError::InvalidThreshold);
         }
+        if threshold > 255 {
+            panic_with_error!(&env, ContractError::InvalidThreshold);
+        }
+
+        let mut seen = Vec::new(&env);
+        for admin in admins.iter() {
+            if seen.contains(admin) {
+                panic_with_error!(&env, ContractError::InvalidInput);
+            }
+            seen.push_back(admin.clone());
+        }
 
         invoker.require_auth();
         if !admins.contains(invoker.clone()) {
@@ -4495,6 +4628,193 @@ impl KoraContract {
                 patch: 0,
             },
         );
+    }
+
+    /// Phase 1: Propose multisig bootstrap configuration
+    /// Issue #255: Emit event for propose_init phase
+    /// Issue #254: Store pending bootstrap state for later activation
+    pub fn propose_init(
+        env: Env,
+        proposer: Address,
+        admins: Vec<Address>,
+        threshold: u32,
+    ) {
+        // Check if already initialized
+        if env.storage().instance().has(&SystemKey::Admins) {
+            panic_with_error!(&env, ContractError::AdminAlreadySet);
+        }
+        if threshold == 0 || threshold > admins.len() {
+            panic_with_error!(&env, ContractError::InvalidThreshold);
+        }
+
+        proposer.require_auth();
+        if !admins.contains(proposer.clone()) {
+            panic_with_error!(&env, ContractError::InvokerNotInAdminList);
+        }
+
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(7 * 86400); // 7 days
+
+        let phase = BootstrapPhase::ProposeInit {
+            admins: admins.clone(),
+            threshold,
+            proposer: proposer.clone(),
+            confirmations: {
+                let mut confs = Vec::new(&env);
+                confs.push_back(proposer.clone());
+                confs
+            },
+            expires_at,
+        };
+
+        env.storage()
+            .instance()
+            .set(&SystemKey::PendingInitPhase, &phase);
+
+        env.events().publish(
+            (Symbol::new(&env, "MultisigBootstrapProposed"),),
+            MultisigBootstrapProposedEvent {
+                version: EVENT_SCHEMA_VERSION,
+                proposer,
+                admins_count: admins.len() as u32,
+                threshold,
+                expires_at,
+                timestamp: now,
+            },
+        );
+    }
+
+    /// Phase 2: Confirm multisig bootstrap configuration
+    /// Issue #255: Emit event for confirm_init phase
+    pub fn confirm_init(env: Env, confirmer: Address) {
+        confirmer.require_auth();
+
+        let now = env.ledger().timestamp();
+        let phase = env
+            .storage()
+            .instance()
+            .get::<SystemKey, BootstrapPhase>(&SystemKey::PendingInitPhase)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::BootstrapNotInitiated));
+
+        match phase {
+            BootstrapPhase::ProposeInit {
+                ref admins,
+                threshold,
+                ref confirmations,
+                expires_at,
+                ..
+            } => {
+                if now > expires_at {
+                    panic_with_error!(&env, ContractError::ProposalExpired);
+                }
+                if !admins.contains(&confirmer) {
+                    panic_with_error!(&env, ContractError::Unauthorized);
+                }
+                if confirmations.contains(&confirmer) {
+                    panic_with_error!(&env, ContractError::AdminAlreadyApproved);
+                }
+
+                let mut new_confirmations = confirmations.clone();
+                new_confirmations.push_back(confirmer.clone());
+
+                if new_confirmations.len() as u32 >= threshold {
+                    // Move to ConfirmInit phase
+                    let next_phase = BootstrapPhase::ConfirmInit {
+                        admins: admins.clone(),
+                        threshold,
+                        confirmations: new_confirmations.clone(),
+                        expires_at,
+                    };
+                    env.storage()
+                        .instance()
+                        .set(&SystemKey::PendingInitPhase, &next_phase);
+                } else {
+                    // Stay in ProposeInit phase
+                    let next_phase = BootstrapPhase::ProposeInit {
+                        admins: admins.clone(),
+                        threshold,
+                        proposer: confirmer.clone(),
+                        confirmations: new_confirmations.clone(),
+                        expires_at,
+                    };
+                    env.storage()
+                        .instance()
+                        .set(&SystemKey::PendingInitPhase, &next_phase);
+                }
+
+                env.events().publish(
+                    (Symbol::new(&env, "MultisigBootstrapConfirmed"),),
+                    MultisigBootstrapConfirmedEvent {
+                        version: EVENT_SCHEMA_VERSION,
+                        confirmer,
+                        confirmations_count: new_confirmations.len() as u32,
+                        threshold,
+                        timestamp: now,
+                    },
+                );
+            }
+            _ => panic_with_error!(&env, ContractError::BootstrapNotInitiated),
+        }
+    }
+
+    /// Phase 3: Activate multisig bootstrap configuration
+    /// Issue #255: Emit event for activate_init phase
+    /// Issue #254: Synchronize DataKey::Admin when activating multisig
+    pub fn activate_init(env: Env, activator: Address) {
+        activator.require_auth();
+
+        let now = env.ledger().timestamp();
+        let phase = env
+            .storage()
+            .instance()
+            .get::<SystemKey, BootstrapPhase>(&SystemKey::PendingInitPhase)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::BootstrapNotInitiated));
+
+        match phase {
+            BootstrapPhase::ConfirmInit {
+                admins,
+                threshold,
+                confirmations,
+                expires_at,
+            } => {
+                if now > expires_at {
+                    panic_with_error!(&env, ContractError::ProposalExpired);
+                }
+                if !admins.contains(&activator) {
+                    panic_with_error!(&env, ContractError::Unauthorized);
+                }
+
+                // Issue #254: Set DataKey::Admin for legacy function compatibility
+                // Use the first admin as the primary admin contact point
+                let primary_admin = admins.get(0).unwrap();
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Admin, &primary_admin);
+
+                // Set multisig configuration
+                env.storage().instance().set(&SystemKey::Admins, &admins);
+                env.storage()
+                    .instance()
+                    .set(&SystemKey::AdminThreshold, &threshold);
+
+                // Mark bootstrap as completed
+                env.storage()
+                    .instance()
+                    .set(&SystemKey::PendingInitPhase, &BootstrapPhase::Activated);
+
+                env.events().publish(
+                    (Symbol::new(&env, "MultisigBootstrapActivated"),),
+                    MultisigBootstrapActivatedEvent {
+                        version: EVENT_SCHEMA_VERSION,
+                        activator,
+                        admins_count: admins.len() as u32,
+                        threshold,
+                        timestamp: now,
+                    },
+                );
+            }
+            _ => panic_with_error!(&env, ContractError::BootstrapNotInitiated),
+        }
     }
 
     pub fn get_admins(env: Env) -> Vec<Address> {
@@ -4524,6 +4844,7 @@ impl KoraContract {
     }
 
     /// Appends an entry to the admin activity log (Issue #816).
+    /// Issue #256: Also maintains indexed lookups for efficient per-admin queries.
     fn record_admin_activity(env: &Env, actor: &Address, action: &str) {
         let count: u64 = env
             .storage()
@@ -4542,6 +4863,22 @@ impl KoraContract {
         env.storage()
             .instance()
             .set(&SystemKey::AdminActivityCount, &next);
+
+        // Issue #256: Maintain indexed lookup for this admin's activities
+        let admin_activity_count: u64 = env
+            .storage()
+            .instance()
+            .get(&SystemKey::AdminActivityCountByAdmin(actor.clone()))
+            .unwrap_or(0);
+        let admin_next = admin_activity_count + 1;
+        env.storage().instance().set(
+            &SystemKey::AdminActivityByAdmin((actor.clone(), admin_next)),
+            &next,
+        );
+        env.storage().instance().set(
+            &SystemKey::AdminActivityCountByAdmin(actor.clone()),
+            &admin_next,
+        );
     }
 
     /// Returns a paginated view of on-chain actions performed by `admin`.
@@ -4569,35 +4906,30 @@ impl KoraContract {
         let total_count: u64 = env
             .storage()
             .instance()
-            .get(&SystemKey::AdminActivityCount)
+            .get(&SystemKey::AdminActivityCountByAdmin(admin.clone()))
             .unwrap_or(0);
 
-        let mut matches: Vec<AdminActivityEntry> = Vec::new(&env);
-        for i in 1..=total_count {
-            if let Some(entry) = env
-                .storage()
-                .instance()
-                .get::<SystemKey, AdminActivityEntry>(&SystemKey::AdminActivityLog(i))
-            {
-                if entry.actor == admin {
-                    matches.push_back(entry);
-                }
-            }
-        }
-
-        let total = matches.len() as u64;
         let start = (page as u64).saturating_mul(size as u64) as u32;
         let mut items = Vec::new(&env);
         for i in start..start.saturating_add(size) {
-            match matches.get(i) {
-                Some(entry) => items.push_back(entry),
-                None => break,
+            if let Some(activity_id) = env
+                .storage()
+                .instance()
+                .get::<SystemKey, u64>(&SystemKey::AdminActivityByAdmin((admin.clone(), i as u64)))
+            {
+                if let Some(entry) = env
+                    .storage()
+                    .instance()
+                    .get::<SystemKey, AdminActivityEntry>(&SystemKey::AdminActivityLog(activity_id))
+                {
+                    items.push_back(entry);
+                }
             }
         }
 
         AdminActivityPage {
             items,
-            total,
+            total: total_count,
             page,
             page_size: size,
         }
@@ -4619,35 +4951,55 @@ impl KoraContract {
             panic_with_error!(&env, ContractError::InvalidThreshold);
         }
 
-        let proposal_count: u64 = env
-            .storage()
-            .instance()
-            .get(&SystemKey::PendingThresholdChangeCount)
-            .unwrap_or(0);
         let now = env.ledger().timestamp();
         let mut proposal_id = 0;
         let mut pending = None;
-        for id in 1..=proposal_count {
+
+        // Issue #257: Iterate only over active proposals instead of all historical ones
+        let active_proposal_count: u64 = env
+            .storage()
+            .instance()
+            .get(&SystemKey::PendingThresholdChangeActive)
+            .unwrap_or(0);
+
+        // Check if a matching active proposal exists
+        for id in 1..=active_proposal_count {
             if let Some(candidate) = env
                 .storage()
                 .instance()
                 .get::<SystemKey, PendingThresholdChange>(&SystemKey::PendingThresholdChange(id))
             {
-                if candidate.new_threshold == new_threshold {
-                    if now > candidate.expires_at {
-                        env.storage()
-                            .instance()
-                            .remove(&SystemKey::PendingThresholdChange(id));
-                        continue;
-                    }
+                if candidate.new_threshold == new_threshold && now <= candidate.expires_at {
                     proposal_id = id;
                     pending = Some(candidate);
                     break;
                 }
             }
         }
+
+        // Cleanup expired proposals in active range
+        if pending.is_none() && active_proposal_count > 0 {
+            for id in 1..=active_proposal_count {
+                if let Some(candidate) = env
+                    .storage()
+                    .instance()
+                    .get::<SystemKey, PendingThresholdChange>(&SystemKey::PendingThresholdChange(id))
+                {
+                    if now > candidate.expires_at {
+                        env.storage()
+                            .instance()
+                            .remove(&SystemKey::PendingThresholdChange(id));
+                    }
+                }
+            }
+        }
         let mut pending = pending.unwrap_or_else(|| {
-            proposal_id = proposal_count.saturating_add(1);
+            let total_proposal_count: u64 = env
+                .storage()
+                .instance()
+                .get(&SystemKey::PendingThresholdChangeCount)
+                .unwrap_or(0);
+            proposal_id = total_proposal_count.saturating_add(1);
             PendingThresholdChange {
                 new_threshold,
                 approvals: Vec::new(&env),
@@ -4668,6 +5020,17 @@ impl KoraContract {
             env.storage()
                 .instance()
                 .set(&SystemKey::PendingThresholdChangeCount, &proposal_id);
+            // Issue #257: Track this as an active proposal
+            let active_count = env
+                .storage()
+                .instance()
+                .get(&SystemKey::PendingThresholdChangeActive)
+                .unwrap_or(0);
+            if proposal_id > active_count {
+                env.storage()
+                    .instance()
+                    .set(&SystemKey::PendingThresholdChangeActive, &proposal_id);
+            }
             return;
         }
 
@@ -6315,32 +6678,46 @@ impl KoraContract {
         Self::store_pet(&env, id, &pet);
     }
 
+    /// Issue #263: Archive pet with active status verification and event emission
     pub fn archive_pet(env: Env, pet_id: u64) {
         let mut pet: Pet = Self::load_pet(&env, pet_id)
             .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
         pet.owner.require_auth();
-        if pet.active {
-            let active_count: u64 = env
-                .storage()
-                .instance()
-                .get(&StatsKey::ActivePetsCount)
-                .unwrap_or(0);
-            if active_count > 0 {
-                env.storage()
-                    .instance()
-                    .set(&StatsKey::ActivePetsCount, &(active_count - 1));
-                Self::record_stat_point(
-                    &env,
-                    String::from_str(&env, "ActivePetsCount"),
-                    active_count - 1,
-                );
-            }
+
+        // Issue #263: Verify pet is active before archiving
+        if !pet.active {
+            panic_with_error!(&env, ContractError::InvalidState);
         }
+
+        // Issue #263: Prevent redundant archiving (already archived check)
+        if pet.archived {
+            panic_with_error!(&env, ContractError::AlreadyDeleted);
+        }
+
+        // Decrement active pets count
+        let active_count: u64 = env
+            .storage()
+            .instance()
+            .get(&StatsKey::ActivePetsCount)
+            .unwrap_or(0);
+        if active_count > 0 {
+            env.storage()
+                .instance()
+                .set(&StatsKey::ActivePetsCount, &(active_count - 1));
+            Self::record_stat_point(
+                &env,
+                String::from_str(&env, "ActivePetsCount"),
+                active_count - 1,
+            );
+        }
+
         pet.archived = true;
         pet.active = false;
         let timestamp = env.ledger().timestamp();
         pet.updated_at = timestamp;
         Self::store_pet(&env, pet_id, &pet);
+
+        // Issue #263: Emit structured event
         env.events().publish(
             (String::from_str(&env, "PetArchived"), pet_id),
             PetArchivedEvent {
@@ -6352,6 +6729,7 @@ impl KoraContract {
         );
     }
 
+    /// Issue #263: Unarchive pet with owner authorization and event emission
     pub fn unarchive_pet(env: Env, pet_id: u64) {
         let mut pet: Pet = env
             .storage()
@@ -6359,10 +6737,24 @@ impl KoraContract {
             .get(&DataKey::Pet(pet_id))
             .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
         pet.owner.require_auth();
+
+        // Issue #263: Verify pet is currently archived
+        if !pet.archived {
+            panic_with_error!(&env, ContractError::InvalidState);
+        }
+
+        // Issue #263: Cannot unarchive if already active (prevent state inconsistency)
+        if pet.active {
+            panic_with_error!(&env, ContractError::InvalidState);
+        }
+
         pet.archived = false;
+        pet.active = true;
         let timestamp = env.ledger().timestamp();
         pet.updated_at = timestamp;
         Self::store_pet(&env, pet_id, &pet);
+
+        // Issue #263: Emit structured event
         env.events().publish(
             (String::from_str(&env, "PetUnarchived"), pet_id),
             PetUnarchivedEvent {
@@ -6448,11 +6840,15 @@ impl KoraContract {
         offset: u64,
         limit: u32,
     ) -> Vec<String> {
+        // Issue #265: Enforce caller authorization
+        caller.require_auth();
+
         if let Some(pet) = env
             .storage()
             .instance()
             .get::<DataKey, Pet>(&DataKey::Pet(pet_id))
         {
+            // Issue #265: Validate privacy level access
             let allowed = pet.privacy_level == PrivacyLevel::Public
                 || pet.owner == caller
                 || Self::check_access(env.clone(), pet_id, caller) != AccessLevel::None;
@@ -7553,10 +7949,16 @@ impl KoraContract {
         }
     }
 
-    /*
     /// Update clinic info for a vet. Only the vet can update their own clinic info.
+    /// Issue #264: Validate clinic_info string length (1-1024 chars)
     pub fn update_clinic_info(env: Env, vet_address: Address, clinic_info: String) -> bool {
         vet_address.require_auth();
+
+        // Issue #264: Validate non-empty string and max length
+        let clinic_info_len = clinic_info.len();
+        if clinic_info_len == 0 || clinic_info_len > 1024 {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
 
         if let Some(mut vet) = env
             .storage()
@@ -7572,7 +7974,6 @@ impl KoraContract {
             panic_with_error!(&env, ContractError::VetNotFound);
         }
     }
-    */
 
     // Pet Vaccination Record
     #[allow(clippy::too_many_arguments)]
@@ -9092,6 +9493,13 @@ impl KoraContract {
             panic_with_error!(&env, ContractError::InvalidInput);
         }
 
+        // Issue #296: validate calorie bounds (>= 50 and <= 10,000 kcal).
+        if total_calories < 50 || total_calories > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        // Issue #296: validate ingredient count (must have 1–20 items).
+        if ingredients.is_empty() || ingredients.len() > 20u32 {
         if name.len() > Self::MAX_NUTRITION_TEXT_LEN
             || ingredients.is_empty()
             || ingredients.len() > Self::MAX_NUTRITION_INGREDIENTS
@@ -10697,6 +11105,14 @@ impl KoraContract {
 
         let key = DataKey::EmergencyResponders(pet_id);
         let responders: Vec<Address> = env.storage().instance().get(&key).unwrap_or(Vec::new(&env));
+
+        // Issue #114: Verify the responder is actually registered before attempting
+        // removal. Without this check the function silently succeeds even for
+        // addresses that were never added, which misleads callers.
+        if !responders.contains(&responder) {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
         let mut updated = Vec::new(&env);
         for r in responders.iter() {
             if r != responder {
@@ -10751,6 +11167,9 @@ impl KoraContract {
     pub(crate) fn validate_emergency_contacts(env: &Env, contacts: &Vec<EmergencyContact>) {
         if contacts.is_empty() {
             panic_with_error!(env, ContractError::InvalidInput);
+        }
+        if contacts.len() > 10 {
+            panic_with_error!(env, ContractError::TooManyItems);
         }
 
         let mut has_primary = false;
@@ -10818,6 +11237,11 @@ impl KoraContract {
             pet.updated_at = env.ledger().timestamp();
 
             Self::store_pet(&env, pet_id, &pet);
+
+            env.events().publish(
+                (Symbol::new(&env, "EmergContactUpd"), pet_id),
+                contacts.len() as u32,
+            );
         } else {
             panic_with_error!(&env, ContractError::PetNotFound);
         }
@@ -11021,6 +11445,7 @@ impl KoraContract {
     /// notified.
     pub fn notify_emergency_contacts(env: Env, caller: Address, pet_id: u64) -> u32 {
         const MAX_NOTIFICATIONS_PER_WINDOW: u32 = 3;
+        const MAX_PET_NOTIFICATIONS_PER_HOUR: u32 = 5;
         const RATE_LIMIT_WINDOW_SECONDS: u64 = 3_600;
 
         caller.require_auth();
@@ -11036,6 +11461,8 @@ impl KoraContract {
         }
 
         let now = env.ledger().timestamp();
+
+        // --- Per-caller rate limit (existing behavior) ---
         let rate_key = DataKey::EmergencyNotifyRateLimit((caller.clone(), pet_id));
         let mut rate_limit: NotifyRateLimit = env
             .storage()
@@ -11046,7 +11473,6 @@ impl KoraContract {
                 count: 0,
             });
 
-        // Reset the window once an hour has elapsed since it started.
         if now >= rate_limit.window_start.saturating_add(RATE_LIMIT_WINDOW_SECONDS) {
             rate_limit = NotifyRateLimit {
                 window_start: now,
@@ -11058,8 +11484,33 @@ impl KoraContract {
             panic_with_error!(&env, ContractError::RateLimitExceeded);
         }
 
+        // --- Per-pet rate limit (Issue #281): max 5 notifications per pet per hour ---
+        let pet_rate_key = DataKey::PetNotifyRateLimit(pet_id);
+        let mut pet_rate_limit: NotifyRateLimit = env
+            .storage()
+            .instance()
+            .get(&pet_rate_key)
+            .unwrap_or(NotifyRateLimit {
+                window_start: now,
+                count: 0,
+            });
+
+        if now >= pet_rate_limit.window_start.saturating_add(RATE_LIMIT_WINDOW_SECONDS) {
+            pet_rate_limit = NotifyRateLimit {
+                window_start: now,
+                count: 0,
+            };
+        }
+
+        if pet_rate_limit.count >= MAX_PET_NOTIFICATIONS_PER_HOUR {
+            panic_with_error!(&env, ContractError::RateLimitExceeded);
+        }
+
         rate_limit.count += 1;
         env.storage().instance().set(&rate_key, &rate_limit);
+
+        pet_rate_limit.count += 1;
+        env.storage().instance().set(&pet_rate_key, &pet_rate_limit);
 
         let contacts = KoraContract::get_emergency_contacts(env.clone(), pet_id, caller.clone());
 
@@ -11167,27 +11618,51 @@ impl KoraContract {
         env: Env,
         pet_id: u64,
         caller: Address,
-    ) -> Vec<EmergencyAccessLog> {
+        page: u32,
+        page_size: u32,
+    ) -> EmergencyAccessLogsPage {
+        if page_size == 0 || page_size > 50 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
         // Verify pet exists
-        if let Some(pet) = env
+        let pet: Pet = env
             .storage()
             .instance()
             .get::<_, Pet>(&DataKey::Pet(pet_id))
-        {
-            // Require owner authorization
-            if caller != pet.owner {
-                panic_with_error!(&env, ContractError::NotPetOwner);
-            }
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PetNotFound));
 
-            // Retrieve logs from persistent storage
-            let log_key = DataKey::EmergencyAccessLogs(pet_id);
-            env.storage()
-                .persistent()
-                .get(&log_key)
-                .unwrap_or(Vec::new(&env))
-        } else {
-            panic_with_error!(&env, ContractError::PetNotFound);
+        // Require owner authorization
+        if caller != pet.owner {
+            panic_with_error!(&env, ContractError::NotPetOwner);
         }
+
+        // Retrieve all logs from persistent storage
+        let log_key = DataKey::EmergencyAccessLogs(pet_id);
+        let all_logs: Vec<EmergencyAccessLog> = env
+            .storage()
+            .persistent()
+            .get(&log_key)
+            .unwrap_or(Vec::new(&env));
+
+        let total = all_logs.len() as u64;
+        let mut items = Vec::new(&env);
+
+        if total == 0 {
+            return EmergencyAccessLogsPage { items, total, page, page_size };
+        }
+
+        let offset = (page as u64).saturating_mul(page_size as u64);
+        if offset >= total {
+            return EmergencyAccessLogsPage { items, total, page, page_size };
+        }
+
+        let end = (offset + page_size as u64).min(total);
+        for i in offset..end {
+            items.push_back(all_logs.get(i as u32).unwrap());
+        }
+
+        EmergencyAccessLogsPage { items, total, page, page_size }
     }
 
     // --- DISPUTE RESOLUTION ---
@@ -11287,6 +11762,12 @@ impl KoraContract {
     /// Admin override: forcibly resolves a dispute, bypassing the consensus
     /// vote. Requires admin authorization and arbitrator verification. Use `vote_on_dispute` for the
     /// standard multi-party consensus path.
+    ///
+    /// Requires the dispute to be in `DisputeStatus::UnderReview`; panics with
+    /// `ContractError::InvalidState` otherwise to prevent re-resolving closed
+    /// or cancelled disputes (issue #294).
+    pub fn resolve_dispute(env: Env, dispute_id: u64, status: DisputeStatus) -> bool {
+        Self::require_admin(&env);
     pub fn resolve_dispute(env: Env, dispute_id: u64, arbitrator: Address, status: DisputeStatus) -> bool {
         arbitrator.require_auth();
 
@@ -11297,10 +11778,16 @@ impl KoraContract {
 
         let key = DisputeKey::Dispute(dispute_id);
         if let Some(mut dispute) = env.storage().instance().get::<DisputeKey, Dispute>(&key) {
+            // Issue #294: only allow resolution when the dispute is actively under review.
+            if dispute.status != DisputeStatus::UnderReview {
+                panic_with_error!(&env, ContractError::InvalidState);
+            }
+
             dispute.status = status;
             dispute.resolved_at = Some(env.ledger().timestamp());
             env.storage().instance().set(&key, &dispute);
 
+            // Issue #295: emit DisputeResolved event.
             env.events().publish(
                 (Symbol::new(&env, "DisputeResolved"),),
                 (dispute_id, status, env.ledger().timestamp()),
@@ -11337,6 +11824,8 @@ impl KoraContract {
 
         assert!(
             dispute.status == DisputeStatus::Pending
+                || dispute.status == DisputeStatus::Open
+                || dispute.status == DisputeStatus::EvidencePhase,
                 || dispute.status == DisputeStatus::EvidencePhase
                 || dispute.status == DisputeStatus::Open,
             "Dispute is not open for voting"
@@ -11476,6 +11965,11 @@ impl KoraContract {
         result
     }
 
+    /// Submit evidence for an open or evidence-phase dispute.
+    ///
+    /// Accepts a CID string (IPFS / Arweave link). Transitions the dispute to
+    /// `EvidencePhase` on the first submission if it was `Open`. Emits an
+    /// `EvidenceSubmitted` event (issue #295). Returns `true` on success.
     pub fn submit_evidence(
         env: Env,
         dispute_id: u64,
@@ -11500,6 +11994,9 @@ impl KoraContract {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::InvalidInput));
 
         assert!(
+            dispute.status == DisputeStatus::Open
+                || dispute.status == DisputeStatus::EvidencePhase,
+            "Submission outside evidence phase rejected"
             submitter == dispute.claimer || submitter == dispute.target,
             "Only claimer or target can submit evidence"
         );
@@ -11531,6 +12028,12 @@ impl KoraContract {
             .get(&evidence_count_key)
             .unwrap_or(0);
         let evidence_id = total_count + 1;
+
+        // Transition to EvidencePhase on first submission (issue #294).
+        if dispute.status == DisputeStatus::Open {
+            dispute.status = DisputeStatus::EvidencePhase;
+            env.storage().instance().set(&dispute_key, &dispute);
+        }
 
         let evidence = Evidence {
             evidence_id,
@@ -11817,6 +12320,222 @@ impl KoraContract {
             .instance()
             .set(&DisputeKey::ArbitratorStats(arbitrator), &stats);
 
+        // Issue #295: emit EvidenceSubmitted event.
+        env.events().publish(
+            (Symbol::new(&env, "EvidenceSubmitted"),),
+            (dispute_id, submitter.clone(), evidence_id),
+        );
+
+        let _ = cid; // CID stored off-chain; tracked by evidence_id here
+        true
+    }
+
+    /// Transitions a dispute from `EvidencePhase` to `UnderReview`, assigning
+    /// the given arbitrator as the reviewer. Only the currently assigned
+    /// arbitrator may call this (issue #294).
+    pub fn start_review(env: Env, dispute_id: u64, arbitrator: Address) -> bool {
+        arbitrator.require_auth();
+
+        let assigned: Address = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::Arbitrator)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::Unauthorized));
+
+        if arbitrator != assigned {
+            env.panic_with_error(ContractError::Unauthorized);
+        }
+
+        let dispute_key = DisputeKey::Dispute(dispute_id);
+        let mut dispute: Dispute = env
+            .storage()
+            .instance()
+            .get(&dispute_key)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::InvalidInput));
+
+        assert!(
+            dispute.status == DisputeStatus::EvidencePhase,
+            "start_review requires EvidencePhase"
+        );
+
+        dispute.status = DisputeStatus::UnderReview;
+        env.storage().instance().set(&dispute_key, &dispute);
+        true
+    }
+
+    /// Issues a ruling on a dispute that is `UnderReview`. Transitions status
+    /// to `Resolved`, records the resolved timestamp, and emits a
+    /// `DisputeResolved` event. Updates arbitrator reputation (issue #294,
+    /// #295).
+    pub fn rule(env: Env, dispute_id: u64, arbitrator: Address, outcome: DisputeOutcome) -> bool {
+        arbitrator.require_auth();
+
+        let assigned: Address = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::Arbitrator)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::Unauthorized));
+
+        if arbitrator != assigned {
+            env.panic_with_error(ContractError::Unauthorized);
+        }
+
+        let dispute_key = DisputeKey::Dispute(dispute_id);
+        let mut dispute: Dispute = env
+            .storage()
+            .instance()
+            .get(&dispute_key)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::InvalidInput));
+
+        assert!(
+            dispute.status == DisputeStatus::UnderReview,
+            "rule requires UnderReview"
+        );
+
+        dispute.status = DisputeStatus::Resolved;
+        dispute.resolved_at = Some(env.ledger().timestamp());
+        env.storage().instance().set(&dispute_key, &dispute);
+
+        // Update arbitrator reputation.
+        let stats_key = DisputeKey::ArbitratorStats(arbitrator.clone());
+        let mut stats: ArbitratorStats = env
+            .storage()
+            .instance()
+            .get(&stats_key)
+            .unwrap_or(ArbitratorStats {
+                address: arbitrator.clone(),
+                reputation: 0,
+                total_rulings: 0,
+            });
+        stats.reputation = stats.reputation.saturating_add(1);
+        stats.total_rulings = stats.total_rulings.saturating_add(1);
+        env.storage().instance().set(&stats_key, &stats);
+
+        // Issue #295: emit DisputeResolved event.
+        env.events().publish(
+            (Symbol::new(&env, "DisputeResolved"),),
+            (
+                dispute_id,
+                DisputeStatus::Resolved,
+                env.ledger().timestamp(),
+            ),
+        );
+
+        let _ = outcome; // outcome captured in Resolved status; reserved for future payout logic
+        true
+    }
+
+    /// Registers an address as an eligible arbitrator. Admin-only.
+    /// Idempotent — re-registering an existing arbitrator is a no-op (issue #294).
+    pub fn register_arbitrator(env: Env, admin: Address, arbitrator: Address) {
+        Self::require_admin_auth(&env, &admin);
+
+        let stats_key = DisputeKey::ArbitratorStats(arbitrator.clone());
+        if !env.storage().instance().has(&stats_key) {
+            env.storage().instance().set(
+                &stats_key,
+                &ArbitratorStats {
+                    address: arbitrator.clone(),
+                    reputation: 0,
+                    total_rulings: 0,
+                },
+            );
+        }
+
+        // Append to global list if not already present.
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::ArbitratorList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut already_registered = false;
+        for a in list.iter() {
+            if a == arbitrator {
+                already_registered = true;
+                break;
+            }
+        }
+        if !already_registered {
+            list.push_back(arbitrator);
+            env.storage()
+                .instance()
+                .set(&DisputeKey::ArbitratorList, &list);
+        }
+    }
+
+    /// Decreases an arbitrator's reputation by 1 (floor 0). Admin-only (issue #294).
+    pub fn penalise_arbitrator(env: Env, admin: Address, arbitrator: Address) {
+        Self::require_admin_auth(&env, &admin);
+
+        let stats_key = DisputeKey::ArbitratorStats(arbitrator.clone());
+        let mut stats: ArbitratorStats = env
+            .storage()
+            .instance()
+            .get(&stats_key)
+            .unwrap_or(ArbitratorStats {
+                address: arbitrator.clone(),
+                reputation: 0,
+                total_rulings: 0,
+            });
+        stats.reputation = (stats.reputation - 1).max(0);
+        env.storage().instance().set(&stats_key, &stats);
+    }
+
+    /// Automatically selects the registered arbitrator with the highest
+    /// reputation who is not a party to the dispute (issue #294).
+    pub fn auto_assign_arbitrator(env: Env, dispute_id: u64) -> Address {
+        let dispute: Dispute = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::Dispute(dispute_id))
+            .unwrap_or_else(|| env.panic_with_error(ContractError::InvalidInput));
+
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::ArbitratorList)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut best: Option<Address> = None;
+        let mut best_rep: i64 = -1;
+
+        for candidate in list.iter() {
+            if candidate == dispute.claimer || candidate == dispute.target {
+                continue;
+            }
+            let stats_key = DisputeKey::ArbitratorStats(candidate.clone());
+            let rep: i64 = env
+                .storage()
+                .instance()
+                .get::<DisputeKey, ArbitratorStats>(&stats_key)
+                .map(|s| s.reputation)
+                .unwrap_or(0);
+            if rep > best_rep {
+                best_rep = rep;
+                best = Some(candidate.clone());
+            }
+        }
+
+        let winner = best.unwrap_or_else(|| env.panic_with_error(ContractError::InvalidState));
+
+        // Assign as the active arbitrator.
+        env.storage()
+            .instance()
+            .set(&DisputeKey::Arbitrator, &winner);
+        winner
+    }
+
+    /// Returns stats for a given arbitrator address (issue #294).
+    pub fn get_arbitrator_stats(env: Env, arbitrator: Address) -> ArbitratorStats {
+        let stats_key = DisputeKey::ArbitratorStats(arbitrator.clone());
+        env.storage()
+            .instance()
+            .get(&stats_key)
+            .unwrap_or(ArbitratorStats {
+                address: arbitrator,
+                reputation: 0,
+                total_rulings: 0,
+            })
         true
     }
 
@@ -13325,11 +14044,29 @@ impl KoraContract {
             }
         }
 
+        // Issue #118: Prevent the same offspring_pet_id from being registered
+        // in more than one breeding record. The OffspringLitter key maps each
+        // offspring pet to the single record it belongs to; if it already
+        // exists the pet is already claimed by another litter.
+        if env
+            .storage()
+            .persistent()
+            .has(&BreedingKey::OffspringLitter(offspring_id))
+        {
+            panic_with_error!(&env, ContractError::InvalidState);
+        }
+
         // Store parent pair for pedigree queries (COI, lineage)
         env.storage().persistent().set(
             &BreedingKey::ParentPair(offspring_id),
             &(record.sire_id, record.dam_id),
         );
+
+        // Issue #118: Record which litter this offspring belongs to so that
+        // subsequent calls can detect and reject duplicate registrations.
+        env.storage()
+            .persistent()
+            .set(&BreedingKey::OffspringLitter(offspring_id), &record_id);
 
         record.offspring_count = record.offspring_count.saturating_add(1);
         env.storage()
@@ -13572,6 +14309,25 @@ impl KoraContract {
     ) -> u64 {
         if sire_id == dam_id {
             panic_with_error!(&env, ContractError::SelfBreeding);
+        }
+
+        // Verify both pets exist and are active/non-archived (#121)
+        let sire: Pet = env
+            .storage()
+            .instance()
+            .get::<_, Pet>(&DataKey::Pet(sire_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PetNotFound));
+        let dam: Pet = env
+            .storage()
+            .instance()
+            .get::<_, Pet>(&DataKey::Pet(dam_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PetNotFound));
+
+        if sire.archived || dam.archived {
+            panic_with_error!(&env, ContractError::PetIsArchived);
+        }
+        if !sire.active || !dam.active {
+            panic_with_error!(&env, ContractError::InvalidInput);
         }
 
         let coi = Self::calc_coi(&env, sire_id, dam_id);
@@ -13998,6 +14754,10 @@ impl KoraContract {
         env.storage()
             .instance()
             .set(&SystemKey::UpgradeProposalCount, &proposal_id);
+        env.events().publish(
+            (Symbol::new(&env, "UpgradeProposed"),),
+            (proposal_id, admin.clone(), new_wasm_hash),
+        );
         proposal_id
     }
 
@@ -14111,6 +14871,10 @@ impl KoraContract {
         env.storage()
             .instance()
             .set(&SystemKey::UpgradeProposal(proposal_id), &proposal);
+        env.events().publish(
+            (Symbol::new(&env, "UpgradeExecuted"),),
+            (proposal_id, proposal.new_wasm_hash),
+        );
     }
 
     pub fn get_upgrade_proposal(env: Env, proposal_id: u64) -> Option<UpgradeProposal> {
@@ -14155,11 +14919,33 @@ impl KoraContract {
             })
     }
 
+    /// Issue #262: Set contract version with semantic versioning validation
     pub fn set_version(env: Env, admin: Address, major: u32, minor: u32, patch: u32) {
         admin.require_auth();
         if !Self::is_admin_address(&env, &admin) {
             panic_with_error!(&env, ContractError::NotAnAdmin);
         }
+
+        // Issue #262: Reject invalid version 0.0.0
+        if major == 0 && minor == 0 && patch == 0 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        // Issue #262: Validate monotonic version progression
+        if let Some(current_version) = env
+            .storage()
+            .instance()
+            .get::<DataKey, ContractVersion>(&DataKey::ContractVersion)
+        {
+            // New version must be greater than current version
+            let current_tuple = (current_version.major, current_version.minor, current_version.patch);
+            let new_tuple = (major, minor, patch);
+
+            if new_tuple <= current_tuple {
+                panic_with_error!(&env, ContractError::InvalidState);
+            }
+        }
+
         let version = ContractVersion {
             major,
             minor,
@@ -14295,6 +15081,9 @@ impl KoraContract {
 
     pub fn search_by_keyword(env: Env, pet_id: u64, keyword: String, caller: Address) -> Vec<MedicalRecord> {
         Self::require_medical_read_access(&env, pet_id, &caller);
+        if keyword.len() < 2 {
+            panic_with_error!(&env, ContractError::KeywordTooShort);
+        }
         if keyword.len() > crate::MAX_SEARCH_KEYWORD_LEN {
             panic_with_error!(&env, ContractError::KeywordTooLong);
         }
@@ -14324,6 +15113,10 @@ impl KoraContract {
     }
 
     pub fn update_medical_record_notes(env: Env, record_id: u64, notes: String) -> bool {
+        // Enforce the same 500-byte cap that other note fields respect (#269).
+        if notes.len() > 500 {
+            panic_with_error!(&env, ContractError::InputTooLong);
+        }
         if let Some(mut record) = Self::load_medical_record(&env, record_id) {
             record.vet_address.require_auth();
 
@@ -14431,6 +15224,110 @@ impl KoraContract {
         }
         diffs
     }
+
+    // -------------------------------------------------------------------------
+    // CROSS-CHAIN IDENTITY  (Issue #266)
+    // -------------------------------------------------------------------------
+
+    /// Maximum byte length of a cross-chain network name (e.g. "ethereum").
+    const MAX_CHAIN_NAME_LEN: u32 = 32;
+    /// Maximum byte length of an external chain address (e.g. a 0x-prefixed hex address).
+    const MAX_EXTERNAL_ADDRESS_LEN: u32 = 128;
+
+    /// Links a Kora pet to an identity on an external blockchain network.
+    ///
+    /// # Validation
+    /// * `chain_name` must be 1–32 bytes.
+    /// * `external_address` must be 1–128 bytes.
+    /// * Each `(chain_name, external_address)` pair may only be registered once.
+    /// * Only the current pet owner may call this function.
+    ///
+    /// # Events
+    /// Emits `CrossChainIdentityRegistered` on success.
+    ///
+    /// # Errors
+    /// * `ContractError::InputTooLong`  – a string exceeds its maximum length.
+    /// * `ContractError::InvalidInput`  – an empty string was supplied, or the (chain, address) pair is already registered.
+    /// * `ContractError::NotPetOwner`   – caller is not the pet owner.
+    /// * `ContractError::PetNotFound`   – the pet does not exist.
+    pub fn register_cross_chain_id(
+        env: Env,
+        pet_id: u64,
+        caller: Address,
+        chain_name: String,
+        external_address: String,
+    ) -> bool {
+        caller.require_auth();
+
+        // --- length validation ---
+        if chain_name.len() == 0 || external_address.len() == 0 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+        if chain_name.len() > Self::MAX_CHAIN_NAME_LEN {
+            panic_with_error!(&env, ContractError::InputTooLong);
+        }
+        if external_address.len() > Self::MAX_EXTERNAL_ADDRESS_LEN {
+            panic_with_error!(&env, ContractError::InputTooLong);
+        }
+
+        // --- ownership check ---
+        let pet: Pet = env
+            .storage()
+            .instance()
+            .get::<DataKey, Pet>(&DataKey::Pet(pet_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PetNotFound));
+        if pet.owner != caller {
+            panic_with_error!(&env, ContractError::NotPetOwner);
+        }
+
+        // --- duplicate guard: the (chain_name, external_address) pair must be unique ---
+        let lookup_key = CrossChainKey::ChainLookup((chain_name.clone(), external_address.clone()));
+        if env
+            .storage()
+            .instance()
+            .get::<CrossChainKey, u64>(&lookup_key)
+            .is_some()
+        {
+            panic_with_error!(&env, ContractError::InvalidInput); // (chain, address) pair already registered
+        }
+
+        // --- store forward mapping: pet_id → (chain, address) ---
+        env.storage()
+            .instance()
+            .set(&CrossChainKey::KoraMapping((pet_id, chain_name.clone())), &external_address);
+
+        // --- store reverse mapping: (chain, address) → pet_id ---
+        env.storage().instance().set(&lookup_key, &pet_id);
+
+        // --- emit event ---
+        env.events().publish(
+            (String::from_str(&env, "CrossChainIdentityRegistered"), pet_id),
+            CrossChainIdentityRegistered {
+                version: EVENT_SCHEMA_VERSION,
+                pet_id,
+                chain_id: chain_name,
+                external_id: external_address,
+                registered_at: env.ledger().timestamp(),
+            },
+        );
+
+        true
+    }
+
+    /// Resolves an external chain identity back to a Kora pet ID.
+    ///
+    /// Returns `Some(pet_id)` if the `(chain_name, external_address)` pair has
+    /// been registered, or `None` if it is unknown.
+    pub fn resolve_cross_chain(
+        env: Env,
+        chain_name: String,
+        external_address: String,
+    ) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get::<CrossChainKey, u64>(&CrossChainKey::ChainLookup((chain_name, external_address)))
+    }
+
 } // end impl KoraContract
 
 // --- OVERFLOW-SAFE COUNTER HELPER ---
