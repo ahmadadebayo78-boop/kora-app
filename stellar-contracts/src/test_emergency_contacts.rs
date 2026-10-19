@@ -712,3 +712,104 @@ fn test_reorder_contact_unused_priority() {
         String::from_str(&env, "First Contact")
     );
 }
+
+#[test]
+fn test_set_emergency_contacts_exceeds_max_rejects() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(KoraContract, ());
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let pet_id = client.register_pet(
+        &owner,
+        &String::from_str(&env, "Buddy"),
+        &String::from_str(&env, "2020-01-01"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Golden Retriever"),
+        &String::from_str(&env, "Golden"),
+        &25u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    // Build 15 contacts (1 primary + 14 non-primary) with unique priorities
+    let mut contacts = soroban_sdk::Vec::new(&env);
+    contacts.push_back(valid_contact(&env, "Contact", "555-0001", "c@e.com", "Vet", true, 1));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0002", "c@e.com", "Friend", false, 2));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0003", "c@e.com", "Friend", false, 3));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0004", "c@e.com", "Friend", false, 4));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0005", "c@e.com", "Friend", false, 5));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0006", "c@e.com", "Friend", false, 6));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0007", "c@e.com", "Friend", false, 7));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0008", "c@e.com", "Friend", false, 8));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0009", "c@e.com", "Friend", false, 9));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0010", "c@e.com", "Friend", false, 10));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0011", "c@e.com", "Friend", false, 11));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0012", "c@e.com", "Friend", false, 12));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0013", "c@e.com", "Friend", false, 13));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0014", "c@e.com", "Friend", false, 14));
+    contacts.push_back(valid_contact(&env, "Contact", "555-0015", "c@e.com", "Friend", false, 15));
+
+    let result = client.try_set_emergency_contacts(
+        &pet_id,
+        &contacts,
+        &soroban_sdk::Vec::new(&env),
+        &String::from_str(&env, ""),
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        ContractError::TooManyItems.into()
+    );
+}
+
+#[test]
+fn test_set_emergency_contacts_emits_event() {
+    use soroban_sdk::{xdr::ContractEventBody, Symbol, TryFromVal, TryIntoVal, Val};
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(KoraContract, ());
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let (pet_id, _) = setup_pet_with_contacts(&env, &client, &owner);
+
+    // Update the contacts with two entries
+    let mut updated = soroban_sdk::Vec::new(&env);
+    updated.push_back(valid_contact(&env, "Alice", "555-1111", "a@e.com", "Vet", true, 1));
+    updated.push_back(valid_contact(&env, "Bob", "555-2222", "b@e.com", "Friend", false, 2));
+
+    client.set_emergency_contacts(
+        &pet_id,
+        &updated,
+        &soroban_sdk::Vec::new(&env),
+        &String::from_str(&env, ""),
+    );
+
+    let target_topic = Symbol::new(&env, "EmergContactUpd");
+    let all = env.events().all();
+    let mut found = false;
+
+    for event in all.events() {
+        let ContractEventBody::V0(body) = &event.body;
+        let mut topics: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
+        for sv in body.topics.iter() {
+            topics.push_back(sv.clone().try_into_val(&env).unwrap());
+        }
+        if topics.len() >= 2 {
+            let t0: Val = topics.get(0).unwrap();
+            if let Ok(sym) = Symbol::try_from_val(&env, &t0) {
+                if sym == target_topic {
+                    let count: u32 = body.data.clone().try_into_val(&env).unwrap();
+                    assert_eq!(count, 2u32, "event data should be the number of contacts (2)");
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(found, "EmergContactUpd event was not emitted");
+}

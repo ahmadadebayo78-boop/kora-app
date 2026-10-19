@@ -41,6 +41,10 @@ somzilla.md
 **/*.snap
 **/*.snap.new
 
+# Proptest regression state directories
+proptest-regressions/
+**/.proptest-regressions/
+
 # Environment / secrets
 .env
 .env.*
